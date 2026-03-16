@@ -6,6 +6,118 @@ const { google } = require("googleapis");
 
 /*
 ====================================
+ENV DIAGNOSTICS
+====================================
+*/
+
+function maskValue(value, visibleStart = 4, visibleEnd = 4) {
+  if (!value) return "(empty)";
+  const str = String(value);
+  if (str.length <= visibleStart + visibleEnd) return str;
+  return `${str.slice(0, visibleStart)}...${str.slice(-visibleEnd)}`;
+}
+
+function logEnvDiagnostics() {
+  const envMap = {
+    BOT_TOKEN: process.env.BOT_TOKEN,
+    WEBHOOK_URL: process.env.WEBHOOK_URL,
+    YOUR_ID: process.env.YOUR_ID,
+    SHEET_ID: process.env.SHEET_ID,
+    SHEET_NAME: process.env.SHEET_NAME,
+    GOOGLE_CLIENT_EMAIL: process.env.GOOGLE_CLIENT_EMAIL,
+    GOOGLE_PRIVATE_KEY: process.env.GOOGLE_PRIVATE_KEY,
+    PORT: process.env.PORT
+  };
+
+  console.log("========== ENV DIAGNOSTICS ==========");
+
+  for (const [key, value] of Object.entries(envMap)) {
+    const exists = value !== undefined && value !== null && String(value).trim() !== "";
+    const safeValue =
+      key === "BOT_TOKEN"
+        ? maskValue(value, 8, 6)
+        : key === "GOOGLE_PRIVATE_KEY"
+        ? exists
+          ? `[present, length=${String(value).length}]`
+          : "(empty)"
+        : exists
+        ? String(value)
+        : "(empty)";
+
+    console.log(`${key}: ${exists ? "FOUND" : "MISSING"} -> ${safeValue}`);
+  }
+
+  console.log("=====================================");
+}
+
+logEnvDiagnostics();
+
+/*
+====================================
+CONFIG
+====================================
+*/
+
+const TOKEN = process.env.BOT_TOKEN;
+const WEBHOOK_URL = process.env.WEBHOOK_URL;
+const PORT = process.env.PORT || 8080;
+const YOUR_ID_RAW = process.env.YOUR_ID;
+const YOUR_ID = Number(YOUR_ID_RAW);
+const SHEET_ID = process.env.SHEET_ID;
+const SHEET_NAME = process.env.SHEET_NAME || "Sheet1";
+
+const missingVars = [];
+
+if (!TOKEN || !String(TOKEN).trim()) missingVars.push("BOT_TOKEN");
+if (!WEBHOOK_URL || !String(WEBHOOK_URL).trim()) missingVars.push("WEBHOOK_URL");
+if (!YOUR_ID_RAW || !String(YOUR_ID_RAW).trim()) missingVars.push("YOUR_ID");
+if (!SHEET_ID || !String(SHEET_ID).trim()) missingVars.push("SHEET_ID");
+
+if (missingVars.length) {
+  console.error("Missing required env vars:", missingVars.join(", "));
+  throw new Error(`Missing required env vars: ${missingVars.join(", ")}`);
+}
+
+if (Number.isNaN(YOUR_ID)) {
+  console.error("YOUR_ID is present but is not a valid number:", YOUR_ID_RAW);
+  throw new Error("YOUR_ID must be a valid number");
+}
+
+const bot = new TelegramBot(TOKEN);
+const app = express();
+app.use(express.json());
+
+/*
+====================================
+GOOGLE SHEETS AUTH
+====================================
+*/
+
+if (!process.env.GOOGLE_CLIENT_EMAIL || !process.env.GOOGLE_PRIVATE_KEY) {
+  console.warn("Google Sheets credentials are not fully set.");
+  console.warn("GOOGLE_CLIENT_EMAIL present:", !!process.env.GOOGLE_CLIENT_EMAIL);
+  console.warn("GOOGLE_PRIVATE_KEY present:", !!process.env.GOOGLE_PRIVATE_KEY);
+}
+
+const auth = new google.auth.GoogleAuth({
+  credentials: {
+    client_email: process.env.GOOGLE_CLIENT_EMAIL,
+    private_key: process.env.GOOGLE_PRIVATE_KEY
+      ? process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, "\n")
+      : undefined
+  },
+  scopes: ["https://www.googleapis.com/auth/spreadsheets"]
+});
+
+const sheets = google.sheets({ version: "v4", auth });
+require("dotenv").config();
+
+const express = require("express");
+const TelegramBot = require("node-telegram-bot-api");
+const { google } = require("googleapis");
+
+/*
+====================================
 CONFIG
 ====================================
 */
