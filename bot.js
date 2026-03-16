@@ -228,12 +228,26 @@ function colLetter(colIndexZeroBased) {
 }
 
 async function getSheetRows() {
-  const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID,
-    range: `${SHEET_NAME}!A:L`
-  });
+  try {
+    console.log(`Trying to load sheet range: ${SHEET_NAME}!A:L`);
 
-  return res.data.values || [];
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId: SHEET_ID,
+      range: `${SHEET_NAME}!A:L`
+    });
+
+    const rows = res.data.values || [];
+    console.log("Sheet rows loaded:", rows.length);
+    return rows;
+  } catch (e) {
+    console.error("getSheetRows error FULL:", e);
+    console.error("getSheetRows error message:", e?.message);
+    console.error(
+      "getSheetRows error response:",
+      e?.response?.data || e?.response?.body || e?.response
+    );
+    throw e;
+  }
 }
 
 async function updateCell(rowNumber, colIndexZeroBased, value) {
@@ -304,12 +318,11 @@ function buildClientMessage(company, orderDate, requestDate, orderDays, requestD
 ====================================
 CHECK CLIENTS
 ====================================
-Уведомление уходит только если:
-- дата последнего заказа старше 30 дней
-- дата последнего запроса старше 30 дней
 */
 
 async function checkClients() {
+  console.log("checkClients started");
+
   const rows = await getSheetRows();
 
   if (!rows.length) {
@@ -320,29 +333,55 @@ async function checkClients() {
   for (let i = 1; i < rows.length; i++) {
     const row = rows[i];
 
+    console.log(`Processing row ${i + 1}:`, row);
+
     const company = row[COL.company];
     const managerId = row[COL.managerId];
     const lastOrderRaw = row[COL.lastOrderDate];
     const lastRequestRaw = row[COL.lastRequestDate];
     const existingAlertMessageId = row[COL.alertMessageId];
 
-    if (!company || !managerId) continue;
-    if (existingAlertMessageId) continue;
+    if (!company || !managerId) {
+      console.log(`Row ${i + 1} skipped: no company or managerId`);
+      continue;
+    }
+
+    if (existingAlertMessageId) {
+      console.log(`Row ${i + 1} skipped: alert already exists`);
+      continue;
+    }
 
     const lastOrderDate = parseDate(lastOrderRaw);
     const lastRequestDate = parseDate(lastRequestRaw);
 
-    if (!lastOrderDate || !lastRequestDate) continue;
+    if (!lastOrderDate || !lastRequestDate) {
+      console.log(`Row ${i + 1} skipped: invalid dates`, {
+        lastOrderRaw,
+        lastRequestRaw
+      });
+      continue;
+    }
 
     const orderDays = daysDiff(lastOrderDate);
     const requestDays = daysDiff(lastRequestDate);
 
-    if (orderDays < 30 || requestDays < 30) continue;
+    console.log(`Row ${i + 1} date diff:`, {
+      orderDays,
+      requestDays
+    });
+
+    if (orderDays < 30 || requestDays < 30) {
+      console.log(`Row ${i + 1} skipped: one of dates is less than 30 days`);
+      continue;
+    }
 
     const effectiveDays = Math.min(orderDays, requestDays);
     const levelData = getLevelByDays(effectiveDays);
 
-    if (!levelData) continue;
+    if (!levelData) {
+      console.log(`Row ${i + 1} skipped: no level data for ${effectiveDays} days`);
+      continue;
+    }
 
     const message = buildClientMessage(
       company,
@@ -370,9 +409,13 @@ async function checkClients() {
 
       console.log(`Alert sent for company: ${company}`);
     } catch (e) {
-      console.log(`Error sending alert for ${company}:`, e?.response?.body || e.message);
+      console.error(`Error sending alert for ${company}:`, e);
+      console.error(`Error sending alert message:`, e?.message);
+      console.error(`Error sending alert response:`, e?.response?.body || e?.response);
     }
   }
+
+  console.log("checkClients finished");
 }
 
 /*
@@ -609,8 +652,14 @@ app.get("/run-check", async (req, res) => {
     await checkClients();
     res.send("checkClients done");
   } catch (e) {
-    console.error("run-check error:", e?.response?.body || e.message || e);
-    res.status(500).send("Error in checkClients");
+    console.error("run-check error FULL:", e);
+    console.error("run-check error message:", e?.message);
+    console.error(
+      "run-check error response:",
+      e?.response?.data || e?.response?.body || e?.response
+    );
+
+    res.status(500).send(`Error in checkClients: ${e?.message || "unknown error"}`);
   }
 });
 
