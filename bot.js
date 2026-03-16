@@ -120,7 +120,7 @@ TABLE STRUCTURE
 ====================================
 
 A = company
-B = manager_name (optional)
+B = manager_name
 C = manager_id
 D = last_order_date
 E = last_request_date
@@ -327,7 +327,6 @@ async function checkClients() {
     const existingAlertMessageId = row[COL.alertMessageId];
 
     if (!company || !managerId) continue;
-
     if (existingAlertMessageId) continue;
 
     const lastOrderDate = parseDate(lastOrderRaw);
@@ -497,11 +496,32 @@ async function weeklyReport() {
 
 /*
 ====================================
+SYSTEM ROUTES
+====================================
+*/
+
+app.get("/", (req, res) => {
+  console.log("ROOT HIT");
+  res.status(200).send("Client Attention Bot is running");
+});
+
+app.get("/debug", (req, res) => {
+  console.log("DEBUG HIT");
+  res.status(200).json({
+    ok: true,
+    message: "debug route works"
+  });
+});
+
+/*
+====================================
 WEBHOOK
 ====================================
 */
 
 app.post("/webhook", async (req, res) => {
+  console.log("WEBHOOK HIT:", JSON.stringify(req.body));
+
   try {
     const update = req.body;
 
@@ -532,6 +552,8 @@ app.post("/webhook", async (req, res) => {
       const chatId = update.message.chat.id;
       const text = update.message.text.trim();
       const messageId = update.message.message_id;
+
+      console.log("MESSAGE TEXT:", text, "CHAT ID:", chatId);
 
       if (pendingComments[chatId]) {
         const result = await saveCommentAndCleanup(chatId, text, messageId);
@@ -576,19 +598,13 @@ app.post("/webhook", async (req, res) => {
 
 /*
 ====================================
-SYSTEM ROUTES
+MANUAL ROUTES
 ====================================
 */
 
-app.get("/", (req, res) => {
-  res.send("Client Attention Bot is running");
-});
-
-app.get("/health", (req, res) => {
-  res.status(200).send("OK");
-});
-
 app.get("/run-check", async (req, res) => {
+  console.log("RUN-CHECK HIT");
+
   try {
     await checkClients();
     res.send("checkClients done");
@@ -599,6 +615,8 @@ app.get("/run-check", async (req, res) => {
 });
 
 app.get("/run-weekly", async (req, res) => {
+  console.log("RUN-WEEKLY HIT");
+
   try {
     await weeklyReport();
     res.send("weeklyReport done");
