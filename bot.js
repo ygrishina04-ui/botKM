@@ -33,9 +33,12 @@ function logEnvDiagnostics() {
 
   for (const [key, value] of Object.entries(envMap)) {
     const exists = value !== undefined && value !== null && String(value).trim() !== "";
+
     const safeValue =
       key === "BOT_TOKEN"
-        ? maskValue(value, 8, 6)
+        ? exists
+          ? maskValue(value, 8, 6)
+          : "(empty)"
         : key === "GOOGLE_PRIVATE_KEY"
         ? exists
           ? `[present, length=${String(value).length}]`
@@ -110,50 +113,6 @@ const auth = new google.auth.GoogleAuth({
 });
 
 const sheets = google.sheets({ version: "v4", auth });
-require("dotenv").config();
-
-const express = require("express");
-const TelegramBot = require("node-telegram-bot-api");
-const { google } = require("googleapis");
-
-/*
-====================================
-CONFIG
-====================================
-*/
-
-const TOKEN = process.env.BOT_TOKEN;
-const WEBHOOK_URL = process.env.WEBHOOK_URL; // example: https://your-app.up.railway.app
-const PORT = process.env.PORT || 8080;
-const YOUR_ID = Number(process.env.YOUR_ID);
-const SHEET_ID = process.env.SHEET_ID;
-const SHEET_NAME = process.env.SHEET_NAME || "Sheet1";
-
-if (!TOKEN || !WEBHOOK_URL || !YOUR_ID || !SHEET_ID) {
-  throw new Error("Missing required env vars: BOT_TOKEN, WEBHOOK_URL, YOUR_ID, SHEET_ID");
-}
-
-const bot = new TelegramBot(TOKEN);
-const app = express();
-app.use(express.json());
-
-/*
-====================================
-GOOGLE SHEETS AUTH
-====================================
-*/
-
-const auth = new google.auth.GoogleAuth({
-  credentials: {
-    client_email: process.env.GOOGLE_CLIENT_EMAIL,
-    private_key: process.env.GOOGLE_PRIVATE_KEY
-      ? process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, "\n")
-      : undefined
-  },
-  scopes: ["https://www.googleapis.com/auth/spreadsheets"]
-});
-
-const sheets = google.sheets({ version: "v4", auth });
 
 /*
 ====================================
@@ -171,10 +130,7 @@ H = level
 I = comment
 J = commented_at
 K = alert_message_id
-L = comment_prompt_message_id
-
-Если у тебя сейчас другая структура —
-просто поменяй индексы ниже.
+L = prompt_message_id
 */
 
 const COL = {
@@ -196,14 +152,6 @@ const COL = {
 ====================================
 IN-MEMORY PENDING COMMENTS
 ====================================
-Формат:
-pendingComments[chatId] = {
-  company,
-  action,
-  rowIndex,
-  alertMessageId,
-  promptMessageId
-}
 */
 
 const pendingComments = {};
@@ -220,14 +168,12 @@ function parseDate(value) {
   if (value instanceof Date && !isNaN(value.getTime())) return value;
 
   if (typeof value === "number") {
-    // Excel/Sheets serial
     const date = new Date(Math.round((value - 25569) * 86400 * 1000));
     return isNaN(date.getTime()) ? null : date;
   }
 
   const str = String(value).trim();
 
-  // dd.mm.yyyy
   const ruMatch = str.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/);
   if (ruMatch) {
     const [, d, m, y] = ruMatch;
@@ -273,7 +219,7 @@ function colLetter(colIndexZeroBased) {
   let columnName = "";
 
   while (dividend > 0) {
-    let modulo = (dividend - 1) % 26;
+    const modulo = (dividend - 1) % 26;
     columnName = String.fromCharCode(65 + modulo) + columnName;
     dividend = Math.floor((dividend - modulo) / 26);
   }
@@ -292,6 +238,7 @@ async function getSheetRows() {
 
 async function updateCell(rowNumber, colIndexZeroBased, value) {
   const column = colLetter(colIndexZeroBased);
+
   await sheets.spreadsheets.values.update({
     spreadsheetId: SHEET_ID,
     range: `${SHEET_NAME}!${column}${rowNumber}`,
@@ -364,7 +311,11 @@ CHECK CLIENTS
 
 async function checkClients() {
   const rows = await getSheetRows();
-  if (!rows.length) return;
+
+  if (!rows.length) {
+    console.log("No rows found in sheet");
+    return;
+  }
 
   for (let i = 1; i < rows.length; i++) {
     const row = rows[i];
@@ -373,12 +324,10 @@ async function checkClients() {
     const managerId = row[COL.managerId];
     const lastOrderRaw = row[COL.lastOrderDate];
     const lastRequestRaw = row[COL.lastRequestDate];
-    const status = row[COL.status];
     const existingAlertMessageId = row[COL.alertMessageId];
 
     if (!company || !managerId) continue;
 
-    // Если уведомление уже висит и еще не обработано — второе не шлем
     if (existingAlertMessageId) continue;
 
     const lastOrderDate = parseDate(lastOrderRaw);
@@ -389,10 +338,8 @@ async function checkClients() {
     const orderDays = daysDiff(lastOrderDate);
     const requestDays = daysDiff(lastRequestDate);
 
-    // Важно: обе даты старше 30 дней
     if (orderDays < 30 || requestDays < 30) continue;
 
-    // Берем "последнюю активность" как более свежую из двух дат
     const effectiveDays = Math.min(orderDays, requestDays);
     const levelData = getLevelByDays(effectiveDays);
 
@@ -412,6 +359,7 @@ async function checkClients() {
       const sent = await sendMessageWithButtons(managerId, message, company);
 
       const rowNumber = i + 1;
+
       await updateRowFields(rowNumber, {
         [COL.sentAt]: new Date().toLocaleString("ru-RU"),
         [COL.level]: levelData.level,
@@ -420,6 +368,8 @@ async function checkClients() {
         [COL.comment]: "",
         [COL.commentedAt]: ""
       });
+
+      console.log(`Alert sent for company: ${company}`);
     } catch (e) {
       console.log(`Error sending alert for ${company}:`, e?.response?.body || e.message);
     }
@@ -428,7 +378,7 @@ async function checkClients() {
 
 /*
 ====================================
-UPDATE STATUS + ASK COMMENT
+START COMMENT FLOW
 ====================================
 */
 
@@ -440,7 +390,6 @@ async function startCommentFlow(chatId, company, action, callbackMessageId) {
 
     if (row[COL.company] === company) {
       const rowNumber = i + 1;
-
       const statusText = action === "contacted" ? "Связался" : "Нерегулярный";
 
       await updateRowFields(rowNumber, {
@@ -472,7 +421,7 @@ async function startCommentFlow(chatId, company, action, callbackMessageId) {
 
 /*
 ====================================
-SAVE COMMENT + CLEAN CHAT
+SAVE COMMENT + CLEANUP
 ====================================
 */
 
@@ -481,7 +430,6 @@ async function saveCommentAndCleanup(chatId, commentText, managerCommentMessageI
   if (!pending) return false;
 
   const { company, action, rowNumber, alertMessageId, promptMessageId } = pending;
-
   const finalStatus = action === "contacted" ? "Связался" : "Нерегулярный";
 
   await updateRowFields(rowNumber, {
@@ -492,19 +440,17 @@ async function saveCommentAndCleanup(chatId, commentText, managerCommentMessageI
     [COL.promptMessageId]: ""
   });
 
-  // Удаляем сообщения по клиенту из чата менеджера
   await safeDeleteMessage(chatId, alertMessageId);
   await safeDeleteMessage(chatId, promptMessageId);
-
-  // Пытаемся удалить и комментарий менеджера тоже
   await safeDeleteMessage(chatId, managerCommentMessageId);
-
-  // Можно прислать тихое подтверждение и тоже потом удалить, но я не стала,
-  // чтобы не плодить новые сообщения.
 
   delete pendingComments[chatId];
 
-  return { company, status: finalStatus, comment: commentText };
+  return {
+    company,
+    status: finalStatus,
+    comment: commentText
+  };
 }
 
 /*
@@ -551,7 +497,7 @@ async function weeklyReport() {
 
 /*
 ====================================
-TELEGRAM WEBHOOK
+WEBHOOK
 ====================================
 */
 
@@ -559,7 +505,6 @@ app.post(`/webhook/${TOKEN}`, async (req, res) => {
   try {
     const update = req.body;
 
-    // CALLBACK BUTTONS
     if (update.callback_query) {
       const callback = update.callback_query;
       const [action, company] = String(callback.data || "").split("|");
@@ -583,7 +528,6 @@ app.post(`/webhook/${TOKEN}`, async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // TEXT COMMENT
     if (update.message && update.message.text) {
       const chatId = update.message.chat.id;
       const text = update.message.text.trim();
@@ -593,7 +537,6 @@ app.post(`/webhook/${TOKEN}`, async (req, res) => {
         const result = await saveCommentAndCleanup(chatId, text, messageId);
 
         if (result) {
-          // Дополнительно шлем тебе уведомление как руководителю
           await bot.sendMessage(
             YOUR_ID,
             `📝 Новый комментарий
@@ -607,12 +550,8 @@ app.post(`/webhook/${TOKEN}`, async (req, res) => {
         return res.sendStatus(200);
       }
 
-      // Команды вручную
       if (text === "/start") {
-        await bot.sendMessage(
-          chatId,
-          "Бот Внимание на клиента активен ✅"
-        );
+        await bot.sendMessage(chatId, "Бот Внимание на клиента активен ✅");
       }
 
       if (text === "/check") {
@@ -649,24 +588,22 @@ app.get("/health", (req, res) => {
   res.status(200).send("OK");
 });
 
-// Ручной запуск проверки через URL
 app.get("/run-check", async (req, res) => {
   try {
     await checkClients();
     res.send("checkClients done");
   } catch (e) {
-    console.error(e);
+    console.error("run-check error:", e?.response?.body || e.message || e);
     res.status(500).send("Error in checkClients");
   }
 });
 
-// Ручной запуск недельного отчета через URL
 app.get("/run-weekly", async (req, res) => {
   try {
     await weeklyReport();
     res.send("weeklyReport done");
   } catch (e) {
-    console.error(e);
+    console.error("run-weekly error:", e?.response?.body || e.message || e);
     res.status(500).send("Error in weeklyReport");
   }
 });
@@ -682,12 +619,14 @@ async function start() {
     console.log(`Server listening on ${PORT}`);
 
     const webhook = `${WEBHOOK_URL}/webhook/${TOKEN}`;
+    console.log("Setting webhook to:", webhook);
+
     await bot.setWebHook(webhook);
 
-    console.log("Webhook set to:", webhook);
+    console.log("Webhook set successfully");
   });
 }
 
 start().catch((e) => {
-  console.error("Start error:", e);
+  console.error("Start error:", e?.response?.body || e.message || e);
 });
