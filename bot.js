@@ -501,7 +501,7 @@ WEBHOOK
 ====================================
 */
 
-app.post(`/webhook/${TOKEN}`, async (req, res) => {
+app.post("/webhook", async (req, res) => {
   try {
     const update = req.body;
 
