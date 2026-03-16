@@ -618,7 +618,7 @@ async function start() {
   app.listen(PORT, "0.0.0.0", async () => {
     console.log(`Server listening on ${PORT}`);
 
-    const webhook = `${WEBHOOK_URL}/webhook/${TOKEN}`;
+    const webhook = `${WEBHOOK_URL}/webhook`;
     console.log("Setting webhook to:", webhook);
 
     await bot.setWebHook(webhook);
