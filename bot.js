@@ -1,699 +1,289 @@
-require("dotenv").config();
+require('dotenv').config();
+const TelegramBot = require('node-telegram-bot-api');
+const { google } = require('googleapis');
+const cron = require('node-cron');
 
-const express = require("express");
-const TelegramBot = require("node-telegram-bot-api");
-const { google } = require("googleapis");
+console.log('=== BOT VERSION 2026-03-17 CLIENT-ATTENTION ===');
 
-/*
-====================================
-ENV DIAGNOSTICS
-====================================
-*/
+// ======================
+// ENV
+// ======================
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const GOOGLE_CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL;
+const GOOGLE_PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY;
+const GOOGLE_SHEET_ID = process.env.GOOGLE_SHEET_ID;
+const GOOGLE_SHEET_RANGE = process.env.GOOGLE_SHEET_RANGE || 'Лист1!A:Z';
+const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
 
-function maskValue(value, visibleStart = 4, visibleEnd = 4) {
-  if (!value) return "(empty)";
-  const str = String(value);
-  if (str.length <= visibleStart + visibleEnd) return str;
-  return `${str.slice(0, visibleStart)}...${str.slice(-visibleEnd)}`;
+// Включи true, если бот работает через polling
+const USE_POLLING = (process.env.USE_POLLING || 'true').toLowerCase() === 'true';
+
+if (!TELEGRAM_BOT_TOKEN) {
+  throw new Error('Не задан TELEGRAM_BOT_TOKEN');
 }
 
-function logEnvDiagnostics() {
-  const envMap = {
-    BOT_TOKEN: process.env.BOT_TOKEN,
-    WEBHOOK_URL: process.env.WEBHOOK_URL,
-    YOUR_ID: process.env.YOUR_ID,
-    SHEET_ID: process.env.SHEET_ID,
-    SHEET_NAME: process.env.SHEET_NAME,
-    GOOGLE_CLIENT_EMAIL: process.env.GOOGLE_CLIENT_EMAIL,
-    GOOGLE_PRIVATE_KEY: process.env.GOOGLE_PRIVATE_KEY,
-    PORT: process.env.PORT
-  };
-
-  console.log("========== ENV DIAGNOSTICS ==========");
-
-  for (const [key, value] of Object.entries(envMap)) {
-    const exists = value !== undefined && value !== null && String(value).trim() !== "";
-
-    const safeValue =
-      key === "BOT_TOKEN"
-        ? exists
-          ? maskValue(value, 8, 6)
-          : "(empty)"
-        : key === "GOOGLE_PRIVATE_KEY"
-        ? exists
-          ? `[present, length=${String(value).length}]`
-          : "(empty)"
-        : exists
-        ? String(value)
-        : "(empty)";
-
-    console.log(`${key}: ${exists ? "FOUND" : "MISSING"} -> ${safeValue}`);
-  }
-
-  console.log("=====================================");
-}
-
-logEnvDiagnostics();
-
-/*
-====================================
-CONFIG
-====================================
-*/
-
-const TOKEN = process.env.BOT_TOKEN;
-const WEBHOOK_URL = process.env.WEBHOOK_URL;
-const PORT = process.env.PORT || 8080;
-const YOUR_ID_RAW = process.env.YOUR_ID;
-const YOUR_ID = Number(YOUR_ID_RAW);
-const SHEET_ID = process.env.SHEET_ID;
-const SHEET_NAME = process.env.SHEET_NAME || "Sheet1";
-
-const missingVars = [];
-
-if (!TOKEN || !String(TOKEN).trim()) missingVars.push("BOT_TOKEN");
-if (!WEBHOOK_URL || !String(WEBHOOK_URL).trim()) missingVars.push("WEBHOOK_URL");
-if (!YOUR_ID_RAW || !String(YOUR_ID_RAW).trim()) missingVars.push("YOUR_ID");
-if (!SHEET_ID || !String(SHEET_ID).trim()) missingVars.push("SHEET_ID");
-
-if (missingVars.length) {
-  console.error("Missing required env vars:", missingVars.join(", "));
-  throw new Error(`Missing required env vars: ${missingVars.join(", ")}`);
-}
-
-if (Number.isNaN(YOUR_ID)) {
-  console.error("YOUR_ID is present but is not a valid number:", YOUR_ID_RAW);
-  throw new Error("YOUR_ID must be a valid number");
-}
-
-const bot = new TelegramBot(TOKEN);
-const app = express();
-app.use(express.json());
-
-/*
-====================================
-GOOGLE SHEETS AUTH
-====================================
-*/
-
-if (!process.env.GOOGLE_CLIENT_EMAIL || !process.env.GOOGLE_PRIVATE_KEY) {
-  console.warn("Google Sheets credentials are not fully set.");
-  console.warn("GOOGLE_CLIENT_EMAIL present:", !!process.env.GOOGLE_CLIENT_EMAIL);
-  console.warn("GOOGLE_PRIVATE_KEY present:", !!process.env.GOOGLE_PRIVATE_KEY);
-}
-
-const auth = new google.auth.GoogleAuth({
-  credentials: {
-    client_email: process.env.GOOGLE_CLIENT_EMAIL,
-    private_key: process.env.GOOGLE_PRIVATE_KEY
-      ? process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, "\n")
-      : undefined
-  },
-  scopes: ["https://www.googleapis.com/auth/spreadsheets"]
+const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, {
+  polling: USE_POLLING,
 });
 
-const sheets = google.sheets({ version: "v4", auth });
-
-/*
-====================================
-TABLE STRUCTURE
-====================================
-
-A = company
-B = manager_name
-C = manager_id
-D = last_order_date
-E = last_request_date
-F = status
-G = sent_at
-H = level
-I = comment
-J = commented_at
-K = alert_message_id
-L = prompt_message_id
-*/
-
-const COL = {
-  company: 0,
-  managerName: 1,
-  managerId: 2,
-  lastOrderDate: 3,
-  lastRequestDate: 4,
-  status: 5,
-  sentAt: 6,
-  level: 7,
-  comment: 8,
-  commentedAt: 9,
-  alertMessageId: 10,
-  promptMessageId: 11
-};
-
-/*
-====================================
-IN-MEMORY PENDING COMMENTS
-====================================
-*/
-
-const pendingComments = {};
-
-/*
-====================================
-HELPERS
-====================================
-*/
-
-function parseDate(value) {
-  if (!value) return null;
-
-  if (value instanceof Date && !isNaN(value.getTime())) return value;
-
-  if (typeof value === "number") {
-    const date = new Date(Math.round((value - 25569) * 86400 * 1000));
-    return isNaN(date.getTime()) ? null : date;
+// ======================
+// GOOGLE AUTH
+// ======================
+function getGoogleAuth() {
+  if (!GOOGLE_CLIENT_EMAIL || !GOOGLE_PRIVATE_KEY) {
+    throw new Error('Не заданы GOOGLE_CLIENT_EMAIL или GOOGLE_PRIVATE_KEY');
   }
 
-  const str = String(value).trim();
+  let privateKey = GOOGLE_PRIVATE_KEY.trim();
 
-  const ruMatch = str.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/);
-  if (ruMatch) {
-    const [, d, m, y] = ruMatch;
-    const date = new Date(Number(y), Number(m) - 1, Number(d));
-    return isNaN(date.getTime()) ? null : date;
+  // Убираем внешние кавычки, если случайно вставились
+  if (
+    (privateKey.startsWith('"') && privateKey.endsWith('"')) ||
+    (privateKey.startsWith("'") && privateKey.endsWith("'"))
+  ) {
+    privateKey = privateKey.slice(1, -1);
   }
 
-  const date = new Date(str);
-  return isNaN(date.getTime()) ? null : date;
-}
+  // Превращаем \n в реальные переносы строк
+  privateKey = privateKey.replace(/\\n/g, '\n');
 
-function formatDate(date) {
-  if (!date) return "—";
-  return date.toLocaleDateString("ru-RU");
-}
-
-function daysDiff(date) {
-  const now = new Date();
-  const diff = now - date;
-  return Math.floor(diff / (1000 * 60 * 60 * 24));
-}
-
-function getLevelByDays(days) {
-  if (days >= 35) {
-    return {
-      level: "🚨 КРИТИЧНО",
-      recommendation: "Свяжись с клиентом срочно. Высокий риск потери клиента."
-    };
-  }
-
-  if (days >= 30) {
-    return {
-      level: "🔴 LOST",
-      recommendation: "Клиент в зоне потери. Требуется активная работа."
-    };
-  }
-
-  return null;
-}
-
-function colLetter(colIndexZeroBased) {
-  let dividend = colIndexZeroBased + 1;
-  let columnName = "";
-
-  while (dividend > 0) {
-    const modulo = (dividend - 1) % 26;
-    columnName = String.fromCharCode(65 + modulo) + columnName;
-    dividend = Math.floor((dividend - modulo) / 26);
-  }
-
-  return columnName;
-}
-
-async function getSheetRows() {
-  try {
-    console.log(`Trying to load sheet range: ${SHEET_NAME}!A:L`);
-
-    const res = await sheets.spreadsheets.values.get({
-      spreadsheetId: SHEET_ID,
-      range: `${SHEET_NAME}!A:L`
-    });
-
-    const rows = res.data.values || [];
-    console.log("Sheet rows loaded:", rows.length);
-    return rows;
-  } catch (e) {
-    console.error("getSheetRows error FULL:", e);
-    console.error("getSheetRows error message:", e?.message);
-    console.error(
-      "getSheetRows error response:",
-      e?.response?.data || e?.response?.body || e?.response
-    );
-    throw e;
-  }
-}
-
-async function updateCell(rowNumber, colIndexZeroBased, value) {
-  const column = colLetter(colIndexZeroBased);
-
-  await sheets.spreadsheets.values.update({
-    spreadsheetId: SHEET_ID,
-    range: `${SHEET_NAME}!${column}${rowNumber}`,
-    valueInputOption: "USER_ENTERED",
-    requestBody: {
-      values: [[value]]
-    }
+  return new google.auth.JWT({
+    email: GOOGLE_CLIENT_EMAIL,
+    key: privateKey,
+    scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
   });
 }
 
-async function updateRowFields(rowNumber, fields) {
-  const updates = Object.entries(fields);
+async function getSheets() {
+  const auth = getGoogleAuth();
+  await auth.authorize();
 
-  for (const [colIndex, value] of updates) {
-    await updateCell(rowNumber, Number(colIndex), value);
-  }
-}
-
-async function sendMessageWithButtons(chatId, text, company) {
-  return bot.sendMessage(chatId, text, {
-    reply_markup: {
-      inline_keyboard: [
-        [
-          { text: "✅ Связался", callback_data: `contacted|${company}` },
-          { text: "⚠ Нерегулярный", callback_data: `irregular|${company}` }
-        ]
-      ]
-    }
+  return google.sheets({
+    version: 'v4',
+    auth,
   });
 }
 
-async function safeDeleteMessage(chatId, messageId) {
-  if (!chatId || !messageId) return;
+// ======================
+// LOAD DATA FROM SHEET
+// ======================
+async function loadClientsFromSheet() {
+  const sheets = await getSheets();
 
-  try {
-    await bot.deleteMessage(chatId, String(messageId));
-  } catch (e) {
-    console.log("Delete message skipped:", e?.response?.body || e.message);
-  }
+  const response = await sheets.spreadsheets.values.get({
+    spreadsheetId: GOOGLE_SHEET_ID,
+    range: GOOGLE_SHEET_RANGE,
+  });
+
+  return response.data.values || [];
 }
 
-async function answerCallback(callbackId, text) {
-  try {
-    await bot.answerCallbackQuery(callbackId, { text });
-  } catch (e) {
-    console.log("answerCallback error:", e?.response?.body || e.message);
-  }
-}
-
-function buildClientMessage(company, orderDate, requestDate, orderDays, requestDays, levelData, effectiveDays) {
-  return `${levelData.level}
-Клиент: ${company}
-
-Последний заказ: ${formatDate(orderDate)} (${orderDays} дн.)
-Последний запрос: ${formatDate(requestDate)} (${requestDays} дн.)
-
-Фактически без активности: ${effectiveDays} дн.
-
-Рекомендация: ${levelData.recommendation}`;
-}
-
-/*
-====================================
-CHECK CLIENTS
-====================================
-*/
-
+// ======================
+// CHECK CLIENTS
+// ======================
+// Логика сейчас универсальная:
+// - берет строки из таблицы
+// - показывает клиентов, где в строке встречается "да", "attention", "внимание", "просрочка", "риск"
+// Позже подстроим точно под твою структуру таблицы.
 async function checkClients() {
-  console.log("checkClients started");
+  try {
+    const rows = await loadClientsFromSheet();
 
-  const rows = await getSheetRows();
+    if (!rows || rows.length === 0) {
+      return 'Таблица пустая или данные не найдены.';
+    }
 
-  if (!rows.length) {
-    console.log("No rows found in sheet");
+    if (rows.length === 1) {
+      return 'В таблице только заголовок, строк для проверки нет.';
+    }
+
+    const headers = rows[0];
+    const dataRows = rows.slice(1);
+
+    const alerts = [];
+
+    for (let i = 0; i < dataRows.length; i++) {
+      const row = dataRows[i];
+
+      const joined = row.join(' | ').toLowerCase();
+
+      const isAttentionRow =
+        joined.includes('да') ||
+        joined.includes('attention') ||
+        joined.includes('внимание') ||
+        joined.includes('просрочка') ||
+        joined.includes('риск');
+
+      if (isAttentionRow) {
+        const clientName = row[0] || `Клиент ${i + 1}`;
+        const manager = row[1] || '-';
+        const comment = row[2] || '-';
+
+        alerts.push(
+          `• ${clientName}\nМенеджер: ${manager}\nКомментарий: ${comment}`
+        );
+      }
+    }
+
+    if (alerts.length === 0) {
+      return `Проверка завершена.\nПотенциально проблемных клиентов не найдено.\n\nВсего строк проверено: ${dataRows.length}`;
+    }
+
+    return `Клиенты, требующие внимания:\n\n${alerts.join('\n\n')}`;
+  } catch (error) {
+    console.error('Error in checkClients:', error);
+    throw error;
+  }
+}
+
+// ======================
+// SAFE SEND
+// ======================
+async function safeSend(chatId, text) {
+  const message = String(text || '').trim();
+
+  if (!message) return;
+
+  // Telegram ограничивает длину сообщения
+  const MAX_LENGTH = 4000;
+
+  if (message.length <= MAX_LENGTH) {
+    await bot.sendMessage(chatId, message);
     return;
   }
 
-  for (let i = 1; i < rows.length; i++) {
-    const row = rows[i];
+  for (let i = 0; i < message.length; i += MAX_LENGTH) {
+    await bot.sendMessage(chatId, message.slice(i, i + MAX_LENGTH));
+  }
+}
 
-    console.log(`Processing row ${i + 1}:`, row);
+// ======================
+// COMMANDS
+// ======================
+bot.onText(/\/start/, async (msg) => {
+  const chatId = msg.chat.id;
 
-    const company = row[COL.company];
-    const managerId = row[COL.managerId];
-    const lastOrderRaw = row[COL.lastOrderDate];
-    const lastRequestRaw = row[COL.lastRequestDate];
-    const existingAlertMessageId = row[COL.alertMessageId];
+  await safeSend(
+    chatId,
+    `Бот активен.
 
-    if (!company || !managerId) {
-      console.log(`Row ${i + 1} skipped: no company or managerId`);
-      continue;
-    }
+Команды:
+/ testmessage — тест отправки сообщения
+/ testsheet — тест чтения Google Sheets
+/ check — ручная проверка клиентов`.replace('/ ', '/')
+  );
+});
 
-    if (existingAlertMessageId) {
-      console.log(`Row ${i + 1} skipped: alert already exists`);
-      continue;
-    }
+bot.onText(/\/testmessage/, async (msg) => {
+  const chatId = msg.chat.id;
 
-    const lastOrderDate = parseDate(lastOrderRaw);
-    const lastRequestDate = parseDate(lastRequestRaw);
+  try {
+    await safeSend(chatId, 'Тестовое сообщение: бот работает.');
+  } catch (error) {
+    console.error('Ошибка в /testmessage:', error);
+    await safeSend(chatId, `Ошибка: ${error.message}`);
+  }
+});
 
-    if (!lastOrderDate || !lastRequestDate) {
-      console.log(`Row ${i + 1} skipped: invalid dates`, {
-        lastOrderRaw,
-        lastRequestRaw
-      });
-      continue;
-    }
+bot.onText(/\/testsheet/, async (msg) => {
+  const chatId = msg.chat.id;
 
-    const orderDays = daysDiff(lastOrderDate);
-    const requestDays = daysDiff(lastRequestDate);
+  try {
+    const rows = await loadClientsFromSheet();
 
-    console.log(`Row ${i + 1} date diff:`, {
-      orderDays,
-      requestDays
-    });
+    const preview = rows
+      .slice(0, 5)
+      .map((row, index) => `${index + 1}: ${row.join(' | ')}`)
+      .join('\n');
 
-    if (orderDays < 30 || requestDays < 30) {
-      console.log(`Row ${i + 1} skipped: one of dates is less than 30 days`);
-      continue;
-    }
+    await safeSend(
+      chatId,
+      `Таблица читается.
+Строк: ${rows.length}
 
-    const effectiveDays = Math.min(orderDays, requestDays);
-    const levelData = getLevelByDays(effectiveDays);
-
-    if (!levelData) {
-      console.log(`Row ${i + 1} skipped: no level data for ${effectiveDays} days`);
-      continue;
-    }
-
-    const message = buildClientMessage(
-      company,
-      lastOrderDate,
-      lastRequestDate,
-      orderDays,
-      requestDays,
-      levelData,
-      effectiveDays
+${preview || 'Нет данных'}`
     );
+  } catch (error) {
+    console.error('Ошибка в /testsheet:', error);
+    await safeSend(chatId, `Ошибка чтения таблицы: ${error.message}`);
+  }
+});
+
+bot.onText(/\/check/, async (msg) => {
+  const chatId = msg.chat.id;
+
+  try {
+    await safeSend(chatId, 'Запускаю ручную проверку клиентов...');
+    const result = await checkClients();
+    await safeSend(chatId, result || 'Проверка завершена.');
+  } catch (error) {
+    console.error('Ошибка в /check:', error);
+    await safeSend(chatId, `Ошибка проверки: ${error.message}`);
+  }
+});
+
+// ======================
+// OPTIONAL: MANUAL SEND TO ADMIN
+// ======================
+bot.onText(/\/sendtest/, async (msg) => {
+  const chatId = msg.chat.id;
+
+  try {
+    if (!ADMIN_CHAT_ID) {
+      return await safeSend(chatId, 'Не задан ADMIN_CHAT_ID в Railway Variables.');
+    }
+
+    await safeSend(ADMIN_CHAT_ID, 'Ручная тестовая рассылка сработала.');
+    await safeSend(chatId, 'Тестовая отправка выполнена.');
+  } catch (error) {
+    console.error('Ошибка в /sendtest:', error);
+    await safeSend(chatId, `Ошибка: ${error.message}`);
+  }
+});
+
+// ======================
+// CRON
+// ======================
+// Каждый день в 09:00 по серверному времени Railway
+// Для Европы удобнее потом настроить серверную TZ или сместить время вручную
+cron.schedule('0 9 * * *', async () => {
+  console.log('=== CRON: плановая проверка клиентов ===');
+
+  if (!ADMIN_CHAT_ID) {
+    console.log('ADMIN_CHAT_ID не задан, cron-уведомление пропущено');
+    return;
+  }
+
+  try {
+    const result = await checkClients();
+    await safeSend(ADMIN_CHAT_ID, `Плановая проверка:\n\n${result}`);
+  } catch (error) {
+    console.error('Ошибка плановой проверки:', error);
 
     try {
-      const sent = await sendMessageWithButtons(managerId, message, company);
-
-      const rowNumber = i + 1;
-
-      await updateRowFields(rowNumber, {
-        [COL.sentAt]: new Date().toLocaleString("ru-RU"),
-        [COL.level]: levelData.level,
-        [COL.alertMessageId]: sent.message_id,
-        [COL.promptMessageId]: "",
-        [COL.comment]: "",
-        [COL.commentedAt]: ""
-      });
-
-      console.log(`Alert sent for company: ${company}`);
-    } catch (e) {
-      console.error(`Error sending alert for ${company}:`, e);
-      console.error(`Error sending alert message:`, e?.message);
-      console.error(`Error sending alert response:`, e?.response?.body || e?.response);
-    }
-  }
-
-  console.log("checkClients finished");
-}
-
-/*
-====================================
-START COMMENT FLOW
-====================================
-*/
-
-async function startCommentFlow(chatId, company, action, callbackMessageId) {
-  const rows = await getSheetRows();
-
-  for (let i = 1; i < rows.length; i++) {
-    const row = rows[i];
-
-    if (row[COL.company] === company) {
-      const rowNumber = i + 1;
-      const statusText = action === "contacted" ? "Связался" : "Нерегулярный";
-
-      await updateRowFields(rowNumber, {
-        [COL.status]: statusText
-      });
-
-      const prompt = await bot.sendMessage(
-        chatId,
-        `✍️ Добавь комментарий по клиенту "${company}" одним сообщением.\n\nПосле комментария уведомление будет убрано из чата.`
+      await safeSend(
+        ADMIN_CHAT_ID,
+        `Ошибка плановой проверки: ${error.message}`
       );
-
-      pendingComments[chatId] = {
-        company,
-        action,
-        rowIndex: i,
-        rowNumber,
-        alertMessageId: callbackMessageId,
-        promptMessageId: prompt.message_id
-      };
-
-      await updateCell(rowNumber, COL.promptMessageId, prompt.message_id);
-
-      return true;
+    } catch (sendError) {
+      console.error('Не удалось отправить сообщение об ошибке:', sendError);
     }
   }
-
-  return false;
-}
-
-/*
-====================================
-SAVE COMMENT + CLEANUP
-====================================
-*/
-
-async function saveCommentAndCleanup(chatId, commentText, managerCommentMessageId) {
-  const pending = pendingComments[chatId];
-  if (!pending) return false;
-
-  const { company, action, rowNumber, alertMessageId, promptMessageId } = pending;
-  const finalStatus = action === "contacted" ? "Связался" : "Нерегулярный";
-
-  await updateRowFields(rowNumber, {
-    [COL.status]: finalStatus,
-    [COL.comment]: commentText,
-    [COL.commentedAt]: new Date().toLocaleString("ru-RU"),
-    [COL.alertMessageId]: "",
-    [COL.promptMessageId]: ""
-  });
-
-  await safeDeleteMessage(chatId, alertMessageId);
-  await safeDeleteMessage(chatId, promptMessageId);
-  await safeDeleteMessage(chatId, managerCommentMessageId);
-
-  delete pendingComments[chatId];
-
-  return {
-    company,
-    status: finalStatus,
-    comment: commentText
-  };
-}
-
-/*
-====================================
-WEEKLY REPORT
-====================================
-*/
-
-async function weeklyReport() {
-  const rows = await getSheetRows();
-  if (!rows.length) return;
-
-  let risk = 0;
-  let lost = 0;
-  let critical = 0;
-  let withComment = 0;
-  let withoutComment = 0;
-
-  for (let i = 1; i < rows.length; i++) {
-    const row = rows[i];
-    const level = row[COL.level] || "";
-    const comment = row[COL.comment] || "";
-    const alertMessageId = row[COL.alertMessageId] || "";
-
-    if (level.includes("РИСК")) risk++;
-    else if (level.includes("LOST")) lost++;
-    else if (level.includes("КРИТИЧНО")) critical++;
-
-    if (comment) withComment++;
-    if (alertMessageId) withoutComment++;
-  }
-
-  const report = `📊 Недельный отчет
-
-🟡 Риск: ${risk}
-🔴 LOST: ${lost}
-🚨 Критично: ${critical}
-
-✅ С комментарием: ${withComment}
-⏳ Без комментария: ${withoutComment}`;
-
-  await bot.sendMessage(YOUR_ID, report);
-}
-
-/*
-====================================
-SYSTEM ROUTES
-====================================
-*/
-
-app.get("/", (req, res) => {
-  console.log("ROOT HIT");
-  res.status(200).send("Client Attention Bot is running");
 });
 
-app.get("/debug", (req, res) => {
-  console.log("DEBUG HIT");
-  res.status(200).json({
-    ok: true,
-    message: "debug route works"
-  });
+// ======================
+// GENERAL ERROR HANDLERS
+// ======================
+bot.on('polling_error', (error) => {
+  console.error('Polling error:', error?.message || error);
 });
 
-/*
-====================================
-WEBHOOK
-====================================
-*/
-
-app.post("/webhook", async (req, res) => {
-  console.log("WEBHOOK HIT:", JSON.stringify(req.body));
-
-  try {
-    const update = req.body;
-
-    if (update.callback_query) {
-      const callback = update.callback_query;
-      const [action, company] = String(callback.data || "").split("|");
-
-      if (!action || !company) {
-        await answerCallback(callback.id, "Некорректные данные");
-        return res.sendStatus(200);
-      }
-
-      const chatId = callback.message.chat.id;
-      const callbackMessageId = callback.message.message_id;
-
-      const ok = await startCommentFlow(chatId, company, action, callbackMessageId);
-
-      if (ok) {
-        await answerCallback(callback.id, "Статус принят, жду комментарий");
-      } else {
-        await answerCallback(callback.id, "Клиент не найден в таблице");
-      }
-
-      return res.sendStatus(200);
-    }
-
-    if (update.message && update.message.text) {
-      const chatId = update.message.chat.id;
-      const text = update.message.text.trim();
-      const messageId = update.message.message_id;
-
-      console.log("MESSAGE TEXT:", text, "CHAT ID:", chatId);
-
-      if (pendingComments[chatId]) {
-        const result = await saveCommentAndCleanup(chatId, text, messageId);
-
-        if (result) {
-          await bot.sendMessage(
-            YOUR_ID,
-            `📝 Новый комментарий
-
-Клиент: ${result.company}
-Статус: ${result.status}
-Комментарий: ${result.comment}`
-          );
-        }
-
-        return res.sendStatus(200);
-      }
-
-      if (text === "/start") {
-        await bot.sendMessage(chatId, "Бот Внимание на клиента активен ✅");
-      }
-
-      if (text === "/check") {
-        await checkClients();
-        await bot.sendMessage(chatId, "Проверка клиентов выполнена ✅");
-      }
-
-      if (text === "/weekly") {
-        await weeklyReport();
-        await bot.sendMessage(chatId, "Недельный отчет отправлен ✅");
-      }
-
-      return res.sendStatus(200);
-    }
-
-    return res.sendStatus(200);
-  } catch (e) {
-    console.error("Webhook error:", e?.response?.body || e.message || e);
-    return res.sendStatus(200);
-  }
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled Rejection:', reason);
 });
 
-/*
-====================================
-MANUAL ROUTES
-====================================
-*/
-
-app.get("/run-check", async (req, res) => {
-  console.log("RUN-CHECK HIT");
-
-  try {
-    await checkClients();
-    res.send("checkClients done");
-  } catch (e) {
-    console.error("run-check error FULL:", e);
-    console.error("run-check error message:", e?.message);
-    console.error(
-      "run-check error response:",
-      e?.response?.data || e?.response?.body || e?.response
-    );
-
-    res.status(500).send(`Error in checkClients: ${e?.message || "unknown error"}`);
-  }
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught Exception:', error);
 });
 
-app.get("/run-weekly", async (req, res) => {
-  console.log("RUN-WEEKLY HIT");
-
-  try {
-    await weeklyReport();
-    res.send("weeklyReport done");
-  } catch (e) {
-    console.error("run-weekly error:", e?.response?.body || e.message || e);
-    res.status(500).send("Error in weeklyReport");
-  }
-});
-
-/*
-====================================
-START SERVER + SET WEBHOOK
-====================================
-*/
-
-async function start() {
-  app.listen(PORT, "0.0.0.0", async () => {
-    console.log(`Server listening on ${PORT}`);
-
-    const webhook = `${WEBHOOK_URL}/webhook`;
-    console.log("Setting webhook to:", webhook);
-
-    await bot.setWebHook(webhook);
-
-    console.log("Webhook set successfully");
-  });
-}
-
-start().catch((e) => {
-  console.error("Start error:", e?.response?.body || e.message || e);
-});
+console.log('Бот запущен');
