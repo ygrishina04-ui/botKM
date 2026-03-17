@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { google } = require('googleapis');
 const cron = require('node-cron');
 
-console.log('=== BOT VERSION 2026-03-17 CLIENT-ATTENTION FULL ===');
+console.log('=== BOT VERSION 2026-03-17 CLIENT-ATTENTION FINAL ===');
 
 // ======================
 // ENV
@@ -16,21 +16,10 @@ const GOOGLE_SHEET_RANGE = process.env.GOOGLE_SHEET_RANGE || 'Лист1!A:L';
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
 const USE_POLLING = (process.env.USE_POLLING || 'true').toLowerCase() === 'true';
 
-if (!TELEGRAM_BOT_TOKEN) {
-  throw new Error('Не задан TELEGRAM_BOT_TOKEN');
-}
-
-if (!GOOGLE_CLIENT_EMAIL) {
-  throw new Error('Не задан GOOGLE_CLIENT_EMAIL');
-}
-
-if (!GOOGLE_PRIVATE_KEY) {
-  throw new Error('Не задан GOOGLE_PRIVATE_KEY');
-}
-
-if (!GOOGLE_SHEET_ID) {
-  throw new Error('Не задан GOOGLE_SHEET_ID');
-}
+if (!TELEGRAM_BOT_TOKEN) throw new Error('Не задан TELEGRAM_BOT_TOKEN');
+if (!GOOGLE_CLIENT_EMAIL) throw new Error('Не задан GOOGLE_CLIENT_EMAIL');
+if (!GOOGLE_PRIVATE_KEY) throw new Error('Не задан GOOGLE_PRIVATE_KEY');
+if (!GOOGLE_SHEET_ID) throw new Error('Не задан GOOGLE_SHEET_ID');
 
 // ======================
 // BOT
@@ -39,9 +28,7 @@ const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, {
   polling: USE_POLLING,
 });
 
-// Храним состояние ожидания комментария:
-// key = Telegram user id
-// value = { rowNumber, company, chatId, messageId }
+// userId -> { rowNumber, company, chatId, messageId, promptMessageId }
 const pendingComments = new Map();
 
 // ======================
@@ -50,7 +37,6 @@ const pendingComments = new Map();
 function getGoogleAuth() {
   let privateKey = GOOGLE_PRIVATE_KEY.trim();
 
-  // Убираем лишние внешние кавычки, если они попали в Railway Variables
   if (
     (privateKey.startsWith('"') && privateKey.endsWith('"')) ||
     (privateKey.startsWith("'") && privateKey.endsWith("'"))
@@ -58,15 +44,12 @@ function getGoogleAuth() {
     privateKey = privateKey.slice(1, -1);
   }
 
-  // Превращаем \n в реальные переносы строк
   privateKey = privateKey.replace(/\\n/g, '\n');
 
   return new google.auth.JWT({
     email: GOOGLE_CLIENT_EMAIL,
     key: privateKey,
-    scopes: [
-      'https://www.googleapis.com/auth/spreadsheets',
-    ],
+    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
   });
 }
 
@@ -89,7 +72,6 @@ function parseDate(dateStr) {
   const value = String(dateStr).trim();
   if (!value) return null;
 
-  // dd.mm.yyyy
   let match = value.match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
   if (match) {
     const [, dd, mm, yyyy] = match;
@@ -97,7 +79,6 @@ function parseDate(dateStr) {
     return isNaN(date.getTime()) ? null : date;
   }
 
-  // yyyy-mm-dd
   match = value.match(/^(\d{4})-(\d{2})-(\d{2})$/);
   if (match) {
     const [, yyyy, mm, dd] = match;
@@ -105,7 +86,6 @@ function parseDate(dateStr) {
     return isNaN(date.getTime()) ? null : date;
   }
 
-  // fallback
   const parsed = new Date(value);
   return isNaN(parsed.getTime()) ? null : parsed;
 }
@@ -136,25 +116,41 @@ function getLatestActivityDate(lastOrderDate, lastRequestDate) {
   return new Date(Math.max(...dates.map((d) => d.getTime())));
 }
 
+function normalizeTelegramId(rawValue) {
+  let value = String(rawValue || '').trim();
+  value = value.replace(/\.0$/, '');
+  return value;
+}
+
+function shortCompanyName(name) {
+  const value = String(name || '').trim();
+  if (!value) return 'Клиент';
+
+  return value
+    .replace(/^ООО\s+/i, '')
+    .replace(/^ИП\s+/i, '')
+    .replace(/^АО\s+/i, '')
+    .replace(/^ЗАО\s+/i, '')
+    .replace(/^ПАО\s+/i, '')
+    .replace(/^["«]/, '')
+    .replace(/["»]$/, '')
+    .trim();
+}
+
 async function safeSend(chatId, text, options = {}) {
   const message = String(text || '').trim();
-  if (!message) return;
+  if (!message) return null;
 
   const MAX_LENGTH = 4000;
 
   if (message.length <= MAX_LENGTH) {
-    return bot.sendMessage(chatId, message, options);
-  }
-
-  const parts = [];
-  for (let i = 0; i < message.length; i += MAX_LENGTH) {
-    parts.push(message.slice(i, i + MAX_LENGTH));
+    return await bot.sendMessage(chatId, message, options);
   }
 
   let lastMessage = null;
-  for (let i = 0; i < parts.length; i++) {
-    const partOptions = i === 0 ? options : {};
-    lastMessage = await bot.sendMessage(chatId, parts[i], partOptions);
+  for (let i = 0; i < message.length; i += MAX_LENGTH) {
+    const part = message.slice(i, i + MAX_LENGTH);
+    lastMessage = await bot.sendMessage(chatId, part, i === 0 ? options : {});
   }
 
   return lastMessage;
@@ -200,9 +196,9 @@ async function updateClientRow(rowNumber, updates) {
 }
 
 // ======================
-// CORE LOGIC
+// MESSAGE BUILDING
 // ======================
-function buildClientMessage(company, lastOrderDateStr, lastRequestDateStr, daysWithoutActivity) {
+function buildClientMessage(company, lastOrderDateStr, daysWithoutActivity) {
   let priority = '';
   let recommendation = '';
 
@@ -220,17 +216,21 @@ function buildClientMessage(company, lastOrderDateStr, lastRequestDateStr, daysW
   return `${priority}
 Клиент - ${company}
 Последний заказ: ${lastOrderDateStr || '-'}
-Последний запрос: ${lastRequestDateStr || '-'}
-Прошло: ${daysWithoutActivity} дней без активности
+Прошло: ${daysWithoutActivity} дней без заказа
 
 Рекомендации: ${recommendation}`;
 }
 
-async function sendCriticalClients(triggerChatId) {
+// ======================
+// CORE LOGIC
+// ======================
+async function sendCriticalClients(triggerChatId = null) {
   const rows = await loadClientsFromSheet();
 
   if (!rows || rows.length < 2) {
-    await safeSend(triggerChatId, 'В таблице нет данных для проверки.');
+    if (triggerChatId) {
+      await safeSend(triggerChatId, 'В таблице нет данных для проверки.');
+    }
     return;
   }
 
@@ -246,15 +246,13 @@ async function sendCriticalClients(triggerChatId) {
 
     const company = (row[0] || '').toString().trim();
     const manager = (row[1] || '').toString().trim();
-    let managerTelegramId = (row[2] || '').toString().trim();
+    let managerTelegramId = normalizeTelegramId(row[2]);
     const lastOrderDateStr = (row[3] || '').toString().trim();
     const lastRequestDateStr = (row[4] || '').toString().trim();
     const status = (row[6] || '').toString().trim();
     const nextCheckDateStr = (row[11] || '').toString().trim();
 
     if (!company) continue;
-
-    managerTelegramId = managerTelegramId.replace(/\.0$/, '');
 
     if (!managerTelegramId || !/^\d+$/.test(managerTelegramId)) {
       skippedNoTelegramId++;
@@ -278,12 +276,7 @@ async function sendCriticalClients(triggerChatId) {
       continue;
     }
 
-    const text = buildClientMessage(
-      company,
-      lastOrderDateStr,
-      lastRequestDateStr,
-      daysWithoutActivity
-    );
+    const text = buildClientMessage(company, lastOrderDateStr, daysWithoutActivity);
 
     try {
       await bot.sendMessage(managerTelegramId, text, {
@@ -313,31 +306,50 @@ async function sendCriticalClients(triggerChatId) {
     }
   }
 
-  await safeSend(
-    triggerChatId,
-    `Проверка завершена.
+  if (triggerChatId) {
+    await safeSend(
+      triggerChatId,
+      `Проверка завершена.
 Отправлено: ${sentCount}
 Без ID: ${skippedNoTelegramId}
 Ошибок: ${failedCount}`
-  );
+    );
+  }
+
+  if (ADMIN_CHAT_ID && String(triggerChatId || '') !== String(ADMIN_CHAT_ID)) {
+    try {
+      await safeSend(
+        ADMIN_CHAT_ID,
+        `Сводка рассылки:
+Отправлено: ${sentCount}
+Без ID: ${skippedNoTelegramId}
+Ошибок: ${failedCount}`
+      );
+    } catch (e) {
+      console.error('Не удалось отправить сводку админу:', e.message);
+    }
+  }
 }
 
 // ======================
 // COMMANDS
 // ======================
 bot.onText(/\/start/, async (msg) => {
-  const chatId = msg.chat.id;
-
   await safeSend(
-    chatId,
+    msg.chat.id,
     `Бот активен.
 
 Команды:
 /testmessage — тестовое сообщение
 /testsheet — тест чтения таблицы
-/check — ручная проверка клиентов
-/sendtest — тест отправки в ADMIN_CHAT_ID`
+/check — ручная рассылка менеджерам
+/sendtest — тест отправки в ADMIN_CHAT_ID
+/myid — показать твой Telegram ID`
   );
+});
+
+bot.onText(/\/myid/, async (msg) => {
+  await safeSend(msg.chat.id, `Твой Telegram ID: ${msg.chat.id}`);
 });
 
 bot.onText(/\/testmessage/, async (msg) => {
@@ -373,7 +385,7 @@ ${preview || 'Нет данных'}`
 
 bot.onText(/\/check/, async (msg) => {
   try {
-    await safeSend(msg.chat.id, 'Запускаю ручную проверку клиентов...');
+    await safeSend(msg.chat.id, 'Запускаю рассылку уведомлений менеджерам...');
     await sendCriticalClients(msg.chat.id);
   } catch (error) {
     console.error('Ошибка в /check:', error);
@@ -396,7 +408,7 @@ bot.onText(/\/sendtest/, async (msg) => {
 });
 
 // ======================
-// CALLBACK: BUTTON "СВЯЗАЛСЯ"
+// CALLBACK
 // ======================
 bot.on('callback_query', async (query) => {
   try {
@@ -422,21 +434,19 @@ bot.on('callback_query', async (query) => {
     const row = rows[rowNumber - 1] || [];
     const company = (row[0] || '').toString().trim() || 'Без названия';
 
+    await bot.answerCallbackQuery(query.id, {
+      text: 'Напиши комментарий по клиенту',
+    });
+
+    const promptMessage = await safeSend(chatId, `Напиши комментарий по клиенту ${company}:`);
+
     pendingComments.set(userId, {
       rowNumber,
       company,
       chatId,
       messageId,
+      promptMessageId: promptMessage?.message_id,
     });
-
-    await bot.answerCallbackQuery(query.id, {
-      text: 'Напиши комментарий по клиенту',
-    });
-
-    const promptMessage = await safeSend(
-  chatId,
-  `Напиши комментарий по клиенту ${company}:`
-);
   } catch (error) {
     console.error('Ошибка callback_query:', error);
 
@@ -449,7 +459,7 @@ bot.on('callback_query', async (query) => {
 });
 
 // ======================
-// MESSAGE: SAVE COMMENT
+// COMMENT SAVE
 // ======================
 bot.on('message', async (msg) => {
   try {
@@ -466,6 +476,7 @@ bot.on('message', async (msg) => {
     const today = new Date();
     const reactionDate = formatDate(today);
     const nextCheckDate = formatDate(addDays(today, 25));
+    const companyShort = shortCompanyName(pending.company);
 
     await updateClientRow(pending.rowNumber, {
       status: 'Связался',
@@ -474,16 +485,25 @@ bot.on('message', async (msg) => {
       nextCheckDate,
     });
 
+    // удаляем карточку клиента
     try {
       await bot.deleteMessage(pending.chatId, String(pending.messageId));
-    } catch (deleteError) {
-      console.error('Не удалось удалить сообщение клиента:', deleteError.message);
+    } catch (e) {
+      console.error('Не удалось удалить карточку:', e.message);
+    }
+
+    // удаляем сообщение "Напиши комментарий..."
+    if (pending.promptMessageId) {
+      try {
+        await bot.deleteMessage(pending.chatId, String(pending.promptMessageId));
+      } catch (e) {
+        console.error('Не удалось удалить prompt:', e.message);
+      }
     }
 
     await safeSend(
       chatId,
-      `Комментарий сохранен по клиенту ${pending.company}.
-Дата реакции: ${reactionDate}
+      `✅ ${companyShort} — отмечен
 Следующая проверка: ${nextCheckDate}`
     );
 
@@ -497,28 +517,20 @@ bot.on('message', async (msg) => {
 // ======================
 // CRON
 // ======================
-// Каждый день в 09:00 по времени сервера
 cron.schedule('0 9 * * *', async () => {
   console.log('=== CRON: плановая проверка клиентов ===');
 
-  if (!ADMIN_CHAT_ID) {
-    console.log('ADMIN_CHAT_ID не задан, cron-рассылка пропущена');
-    return;
-  }
-
   try {
-    await safeSend(ADMIN_CHAT_ID, 'Запускаю плановую проверку клиентов...');
-    await sendCriticalClients(ADMIN_CHAT_ID);
+    await sendCriticalClients(ADMIN_CHAT_ID || null);
   } catch (error) {
     console.error('Ошибка плановой проверки:', error);
 
-    try {
-      await safeSend(
-        ADMIN_CHAT_ID,
-        `Ошибка плановой проверки: ${error.message}`
-      );
-    } catch (sendError) {
-      console.error('Не удалось отправить сообщение об ошибке:', sendError.message);
+    if (ADMIN_CHAT_ID) {
+      try {
+        await safeSend(ADMIN_CHAT_ID, `Ошибка плановой проверки: ${error.message}`);
+      } catch (e) {
+        console.error('Не удалось отправить ошибку админу:', e.message);
+      }
     }
   }
 });
