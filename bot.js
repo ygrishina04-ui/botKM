@@ -226,52 +226,54 @@ function buildClientMessage(company, lastOrderDateStr, lastRequestDateStr, daysW
 Рекомендации: ${recommendation}`;
 }
 
-async function sendCriticalClients(chatId) {
+async function sendCriticalClients(triggerChatId) {
   const rows = await loadClientsFromSheet();
 
   if (!rows || rows.length < 2) {
-    await safeSend(chatId, 'В таблице нет данных для проверки.');
+    await safeSend(triggerChatId, 'В таблице нет данных для проверки.');
     return;
   }
 
   const dataRows = rows.slice(1);
   const today = new Date();
+
   let sentCount = 0;
+  let skippedNoTelegramId = 0;
+  let failedCount = 0;
 
   for (let i = 0; i < dataRows.length; i++) {
     const row = dataRows[i];
 
     const company = (row[0] || '').toString().trim();
     const manager = (row[1] || '').toString().trim();
-    const managerTelegramId = (row[2] || '').toString().trim();
+    let managerTelegramId = (row[2] || '').toString().trim();
     const lastOrderDateStr = (row[3] || '').toString().trim();
     const lastRequestDateStr = (row[4] || '').toString().trim();
-    const ordersCount = (row[5] || '').toString().trim();
     const status = (row[6] || '').toString().trim();
-    const level = (row[7] || '').toString().trim();
-    const notificationDateStr = (row[8] || '').toString().trim();
-    const comment = (row[9] || '').toString().trim();
-    const reactionDateStr = (row[10] || '').toString().trim();
     const nextCheckDateStr = (row[11] || '').toString().trim();
 
     if (!company) continue;
+
+    managerTelegramId = managerTelegramId.replace(/\.0$/, '');
+
+    if (!managerTelegramId || !/^\d+$/.test(managerTelegramId)) {
+      skippedNoTelegramId++;
+      continue;
+    }
 
     const lastOrderDate = parseDate(lastOrderDateStr);
     const lastRequestDate = parseDate(lastRequestDateStr);
     const nextCheckDate = parseDate(nextCheckDateStr);
 
-    // Если после реакции менеджера еще не наступила следующая проверка — пропускаем
     if (status.toLowerCase() === 'связался' && nextCheckDate && nextCheckDate > today) {
       continue;
     }
 
-    // Берем самую свежую дату активности клиента
     const latestActivityDate = getLatestActivityDate(lastOrderDate, lastRequestDate);
     if (!latestActivityDate) continue;
 
     const daysWithoutActivity = daysBetween(latestActivityDate, today);
 
-    // До 25 дней без активности не уведомляем
     if (daysWithoutActivity < 25) {
       continue;
     }
@@ -283,34 +285,41 @@ async function sendCriticalClients(chatId) {
       daysWithoutActivity
     );
 
-    const sentMessage = await bot.sendMessage(chatId, text, {
-      reply_markup: {
-        inline_keyboard: [
-          [
-            {
-              text: 'Связался',
-              callback_data: `contacted_${i + 2}`, // +2: строка в Sheets с учетом заголовка
-            },
-          ],
-        ],
-      },
-    });
-
-    // Ставим дату уведомления в таблицу
     try {
+      await bot.sendMessage(managerTelegramId, text, {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: 'Связался',
+                callback_data: `contacted_${i + 2}`,
+              },
+            ],
+          ],
+        },
+      });
+
       await updateClientRow(i + 2, {
         notificationDate: formatDate(today),
       });
-    } catch (updateError) {
-      console.error(`Не удалось обновить дату уведомления для ${company}:`, updateError.message);
+
+      sentCount++;
+    } catch (error) {
+      failedCount++;
+      console.error(
+        `Не удалось отправить менеджеру ${manager} (${managerTelegramId}) по клиенту ${company}:`,
+        error.response?.body || error.message || error
+      );
     }
-
-    sentCount++;
   }
 
-  if (sentCount === 0) {
-    await safeSend(chatId, 'Сейчас нет клиентов, требующих внимания.');
-  }
+  await safeSend(
+    triggerChatId,
+    `Проверка завершена.
+Отправлено: ${sentCount}
+Без ID: ${skippedNoTelegramId}
+Ошибок: ${failedCount}`
+  );
 }
 
 // ======================
