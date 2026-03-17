@@ -89,44 +89,43 @@ async function checkClients() {
   try {
     const rows = await loadClientsFromSheet();
 
-    if (!rows || rows.length === 0) {
-      return 'Таблица пустая или данные не найдены.';
+    if (!rows || rows.length < 2) {
+      return 'В таблице нет данных для проверки.';
     }
 
-    if (rows.length === 1) {
-      return 'В таблице только заголовок, строк для проверки нет.';
-    }
-
-    const headers = rows[0];
     const dataRows = rows.slice(1);
-
     const alerts = [];
 
-    for (let i = 0; i < dataRows.length; i++) {
-      const row = dataRows[i];
+    for (const row of dataRows) {
+      const company = (row[0] || '').toString().trim();
+      const manager = (row[1] || '').toString().trim();
+      const lastOrderDate = (row[3] || '').toString().trim();
+      const lastRequestDate = (row[4] || '').toString().trim();
+      const status = (row[6] || '').toString().trim();
+      const level = (row[7] || '').toString().trim();
+      const comment = (row[9] || '').toString().trim();
+      const nextCheckDate = (row[11] || '').toString().trim();
 
-      const joined = row.join(' | ').toLowerCase();
+      const normalizedStatus = status.toLowerCase();
+      const needsAttention =
+        normalizedStatus === 'нерегулярный' || normalizedStatus === '';
 
-      const isAttentionRow =
-        joined.includes('да') ||
-        joined.includes('attention') ||
-        joined.includes('внимание') ||
-        joined.includes('просрочка') ||
-        joined.includes('риск');
+      if (!needsAttention) continue;
 
-      if (isAttentionRow) {
-        const clientName = row[0] || `Клиент ${i + 1}`;
-        const manager = row[1] || '-';
-        const comment = row[2] || '-';
-
-        alerts.push(
-          `• ${clientName}\nМенеджер: ${manager}\nКомментарий: ${comment}`
-        );
-      }
+      alerts.push(
+        `• ${company || 'Без названия'}
+Менеджер: ${manager || '-'}
+Статус: ${status || 'пусто'}
+Уровень: ${level || '-'}
+Последний заказ: ${lastOrderDate || '-'}
+Последний запрос: ${lastRequestDate || '-'}
+Комментарий: ${comment || '-'}
+Следующая проверка: ${nextCheckDate || '-'}`
+      );
     }
 
-    if (alerts.length === 0) {
-      return `Проверка завершена.\nПотенциально проблемных клиентов не найдено.\n\nВсего строк проверено: ${dataRows.length}`;
+    if (!alerts.length) {
+      return 'Клиентов, требующих внимания, не найдено.';
     }
 
     return `Клиенты, требующие внимания:\n\n${alerts.join('\n\n')}`;
