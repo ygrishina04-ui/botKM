@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { google } = require('googleapis');
 const cron = require('node-cron');
 
-console.log('=== BOT VERSION 2026-03-17 CLIENT-ATTENTION FINAL ===');
+console.log('=== BOT VERSION 2026-03-17 CLIENT-ATTENTION FINAL VLADIVOSTOK ===');
 
 // ======================
 // ENV
@@ -137,6 +137,29 @@ function shortCompanyName(name) {
     .trim();
 }
 
+function isSameDate(dateA, dateB) {
+  if (!dateA || !dateB) return false;
+
+  return (
+    dateA.getFullYear() === dateB.getFullYear() &&
+    dateA.getMonth() === dateB.getMonth() &&
+    dateA.getDate() === dateB.getDate()
+  );
+}
+
+function addCount(map, key, value = 1) {
+  map.set(key, (map.get(key) || 0) + value);
+}
+
+function formatManagerStats(title, statsMap) {
+  const entries = [...statsMap.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], 'ru'));
+  if (!entries.length) {
+    return `${title}:\n• Нет`;
+  }
+
+  return `${title}:\n${entries.map(([manager, count]) => `• ${manager} — ${count}`).join('\n')}`;
+}
+
 async function safeSend(chatId, text, options = {}) {
   const message = String(text || '').trim();
   if (!message) return null;
@@ -222,6 +245,64 @@ function buildClientMessage(company, lastOrderDateStr, daysWithoutActivity) {
 }
 
 // ======================
+// REPORTS
+// ======================
+function buildLeaderReport(rows, reportDate) {
+  const dataRows = rows.slice(1);
+
+  let contactedTotal = 0;
+  let notReactedTotal = 0;
+
+  const contactedByManager = new Map();
+  const notReactedByManager = new Map();
+
+  for (const row of dataRows) {
+    const manager = (row[1] || 'Без менеджера').toString().trim();
+    const notificationDateStr = (row[8] || '').toString().trim();
+    const reactionDateStr = (row[10] || '').toString().trim();
+
+    const notificationDate = parseDate(notificationDateStr);
+    const reactionDate = parseDate(reactionDateStr);
+
+    const notifiedToday = notificationDate && isSameDate(notificationDate, reportDate);
+    const reactedToday = reactionDate && isSameDate(reactionDate, reportDate);
+
+    if (reactedToday) {
+      contactedTotal++;
+      addCount(contactedByManager, manager);
+    }
+
+    if (notifiedToday && !reactedToday) {
+      notReactedTotal++;
+      addCount(notReactedByManager, manager);
+    }
+  }
+
+  return `📊 Ежедневный отчет по клиентам
+
+Связались: ${contactedTotal}
+Не отреагировали: ${notReactedTotal}
+
+${formatManagerStats('Связались', contactedByManager)}
+
+${formatManagerStats('Не отреагировали', notReactedByManager)}`;
+}
+
+async function sendLeaderReport() {
+  if (!ADMIN_CHAT_ID) return;
+
+  const rows = await loadClientsFromSheet();
+  if (!rows || rows.length < 2) {
+    await safeSend(ADMIN_CHAT_ID, '📊 Ежедневный отчет: в таблице нет данных.');
+    return;
+  }
+
+  const today = new Date();
+  const reportText = buildLeaderReport(rows, today);
+  await safeSend(ADMIN_CHAT_ID, reportText);
+}
+
+// ======================
 // CORE LOGIC
 // ======================
 async function sendCriticalClients(triggerChatId = null) {
@@ -240,16 +321,18 @@ async function sendCriticalClients(triggerChatId = null) {
   let sentCount = 0;
   let skippedNoTelegramId = 0;
   let failedCount = 0;
+  let skippedAlreadySentToday = 0;
 
   for (let i = 0; i < dataRows.length; i++) {
     const row = dataRows[i];
 
     const company = (row[0] || '').toString().trim();
     const manager = (row[1] || '').toString().trim();
-    let managerTelegramId = normalizeTelegramId(row[2]);
+    const managerTelegramId = normalizeTelegramId(row[2]);
     const lastOrderDateStr = (row[3] || '').toString().trim();
     const lastRequestDateStr = (row[4] || '').toString().trim();
     const status = (row[6] || '').toString().trim();
+    const notificationDateStr = (row[8] || '').toString().trim();
     const nextCheckDateStr = (row[11] || '').toString().trim();
 
     if (!company) continue;
@@ -261,9 +344,15 @@ async function sendCriticalClients(triggerChatId = null) {
 
     const lastOrderDate = parseDate(lastOrderDateStr);
     const lastRequestDate = parseDate(lastRequestDateStr);
+    const notificationDate = parseDate(notificationDateStr);
     const nextCheckDate = parseDate(nextCheckDateStr);
 
     if (status.toLowerCase() === 'связался' && nextCheckDate && nextCheckDate > today) {
+      continue;
+    }
+
+    if (notificationDate && isSameDate(notificationDate, today)) {
+      skippedAlreadySentToday++;
       continue;
     }
 
@@ -311,23 +400,10 @@ async function sendCriticalClients(triggerChatId = null) {
       triggerChatId,
       `Проверка завершена.
 Отправлено: ${sentCount}
+Уже было сегодня: ${skippedAlreadySentToday}
 Без ID: ${skippedNoTelegramId}
 Ошибок: ${failedCount}`
     );
-  }
-
-  if (ADMIN_CHAT_ID && String(triggerChatId || '') !== String(ADMIN_CHAT_ID)) {
-    try {
-      await safeSend(
-        ADMIN_CHAT_ID,
-        `Сводка рассылки:
-Отправлено: ${sentCount}
-Без ID: ${skippedNoTelegramId}
-Ошибок: ${failedCount}`
-      );
-    } catch (e) {
-      console.error('Не удалось отправить сводку админу:', e.message);
-    }
   }
 }
 
@@ -343,6 +419,7 @@ bot.onText(/\/start/, async (msg) => {
 /testmessage — тестовое сообщение
 /testsheet — тест чтения таблицы
 /check — ручная рассылка менеджерам
+/report — отчет руководителю за сегодня
 /sendtest — тест отправки в ADMIN_CHAT_ID
 /myid — показать твой Telegram ID`
   );
@@ -390,6 +467,21 @@ bot.onText(/\/check/, async (msg) => {
   } catch (error) {
     console.error('Ошибка в /check:', error);
     await safeSend(msg.chat.id, `Ошибка проверки: ${error.message}`);
+  }
+});
+
+bot.onText(/\/report/, async (msg) => {
+  try {
+    const rows = await loadClientsFromSheet();
+    if (!rows || rows.length < 2) {
+      return await safeSend(msg.chat.id, 'В таблице нет данных для отчета.');
+    }
+
+    const text = buildLeaderReport(rows, new Date());
+    await safeSend(msg.chat.id, text);
+  } catch (error) {
+    console.error('Ошибка в /report:', error);
+    await safeSend(msg.chat.id, `Ошибка отчета: ${error.message}`);
   }
 });
 
@@ -485,14 +577,12 @@ bot.on('message', async (msg) => {
       nextCheckDate,
     });
 
-    // удаляем карточку клиента
     try {
       await bot.deleteMessage(pending.chatId, String(pending.messageId));
     } catch (e) {
       console.error('Не удалось удалить карточку:', e.message);
     }
 
-    // удаляем сообщение "Напиши комментарий..."
     if (pending.promptMessageId) {
       try {
         await bot.deleteMessage(pending.chatId, String(pending.promptMessageId));
@@ -517,23 +607,30 @@ bot.on('message', async (msg) => {
 // ======================
 // CRON
 // ======================
-cron.schedule('0 9 * * *', async () => {
-  console.log('=== CRON: плановая проверка клиентов ===');
+cron.schedule(
+  '0 11 * * 1,3,5',
+  async () => {
+    console.log('=== CRON: плановая проверка клиентов ===');
 
-  try {
-    await sendCriticalClients(ADMIN_CHAT_ID || null);
-  } catch (error) {
-    console.error('Ошибка плановой проверки:', error);
+    try {
+      await sendCriticalClients(ADMIN_CHAT_ID || null);
+      await sendLeaderReport();
+    } catch (error) {
+      console.error('Ошибка плановой проверки:', error);
 
-    if (ADMIN_CHAT_ID) {
-      try {
-        await safeSend(ADMIN_CHAT_ID, `Ошибка плановой проверки: ${error.message}`);
-      } catch (e) {
-        console.error('Не удалось отправить ошибку админу:', e.message);
+      if (ADMIN_CHAT_ID) {
+        try {
+          await safeSend(ADMIN_CHAT_ID, `Ошибка плановой проверки: ${error.message}`);
+        } catch (e) {
+          console.error('Не удалось отправить ошибку админу:', e.message);
+        }
       }
     }
+  },
+  {
+    timezone: 'Asia/Vladivostok',
   }
-});
+);
 
 // ======================
 // ERRORS
