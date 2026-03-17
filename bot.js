@@ -433,7 +433,10 @@ bot.on('callback_query', async (query) => {
       text: 'Напиши комментарий по клиенту',
     });
 
-    await safeSend(chatId, `Напиши комментарий по клиенту ${company}:`);
+    const promptMessage = await safeSend(
+  chatId,
+  `Напиши комментарий по клиенту ${company}:`
+);
   } catch (error) {
     console.error('Ошибка callback_query:', error);
 
