@@ -1,650 +1,712 @@
-require('dotenv').config();
-const TelegramBot = require('node-telegram-bot-api');
-const { google } = require('googleapis');
-const cron = require('node-cron');
+require("dotenv").config();
 
-console.log('=== BOT VERSION 2026-03-17 CLIENT-ATTENTION FINAL VLADIVOSTOK ===');
+const express = require("express");
+const TelegramBot = require("node-telegram-bot-api");
+const { google } = require("googleapis");
 
-// ======================
-// ENV
-// ======================
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const GOOGLE_CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL;
-const GOOGLE_PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY;
-const GOOGLE_SHEET_ID = process.env.GOOGLE_SHEET_ID;
-const GOOGLE_SHEET_RANGE = process.env.GOOGLE_SHEET_RANGE || 'Лист1!A:L';
-const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
-const USE_POLLING = (process.env.USE_POLLING || 'true').toLowerCase() === 'true';
+/*
+====================================
+ENV DIAGNOSTICS
+====================================
+*/
 
-if (!TELEGRAM_BOT_TOKEN) throw new Error('Не задан TELEGRAM_BOT_TOKEN');
-if (!GOOGLE_CLIENT_EMAIL) throw new Error('Не задан GOOGLE_CLIENT_EMAIL');
-if (!GOOGLE_PRIVATE_KEY) throw new Error('Не задан GOOGLE_PRIVATE_KEY');
-if (!GOOGLE_SHEET_ID) throw new Error('Не задан GOOGLE_SHEET_ID');
+function maskValue(value, visibleStart = 4, visibleEnd = 4) {
+  if (!value) return "(empty)";
+  const str = String(value);
+  if (str.length <= visibleStart + visibleEnd) return str;
+  return `${str.slice(0, visibleStart)}...${str.slice(-visibleEnd)}`;
+}
 
-// ======================
-// BOT
-// ======================
-const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, {
-  polling: USE_POLLING,
+function logEnvDiagnostics() {
+  const envMap = {
+    BOT_TOKEN: process.env.BOT_TOKEN,
+    WEBHOOK_URL: process.env.WEBHOOK_URL,
+    YOUR_ID: process.env.YOUR_ID,
+    SHEET_ID: process.env.SHEET_ID,
+    SHEET_NAME: process.env.SHEET_NAME,
+    GOOGLE_CLIENT_EMAIL: process.env.GOOGLE_CLIENT_EMAIL,
+    GOOGLE_PRIVATE_KEY: process.env.GOOGLE_PRIVATE_KEY,
+    PORT: process.env.PORT
+  };
+
+  console.log("========== ENV DIAGNOSTICS ==========");
+
+  for (const [key, value] of Object.entries(envMap)) {
+    const exists = value !== undefined && value !== null && String(value).trim() !== "";
+
+    const safeValue =
+      key === "BOT_TOKEN"
+        ? exists
+          ? maskValue(value, 8, 6)
+          : "(empty)"
+        : key === "GOOGLE_PRIVATE_KEY"
+        ? exists
+          ? `[present, length=${String(value).length}]`
+          : "(empty)"
+        : exists
+        ? String(value)
+        : "(empty)";
+
+    console.log(`${key}: ${exists ? "FOUND" : "MISSING"} -> ${safeValue}`);
+  }
+
+  console.log("=====================================");
+}
+
+logEnvDiagnostics();
+
+/*
+====================================
+CONFIG
+====================================
+*/
+
+const TOKEN = process.env.BOT_TOKEN;
+const WEBHOOK_URL = process.env.WEBHOOK_URL;
+const PORT = process.env.PORT || 8080;
+const YOUR_ID_RAW = process.env.YOUR_ID;
+const YOUR_ID = Number(YOUR_ID_RAW);
+const SHEET_ID = process.env.SHEET_ID;
+const SHEET_NAME = process.env.SHEET_NAME || "Sheet1";
+
+const missingVars = [];
+
+if (!TOKEN || !String(TOKEN).trim()) missingVars.push("BOT_TOKEN");
+if (!WEBHOOK_URL || !String(WEBHOOK_URL).trim()) missingVars.push("WEBHOOK_URL");
+if (!YOUR_ID_RAW || !String(YOUR_ID_RAW).trim()) missingVars.push("YOUR_ID");
+if (!SHEET_ID || !String(SHEET_ID).trim()) missingVars.push("SHEET_ID");
+
+if (missingVars.length) {
+  console.error("Missing required env vars:", missingVars.join(", "));
+  throw new Error(`Missing required env vars: ${missingVars.join(", ")}`);
+}
+
+if (Number.isNaN(YOUR_ID)) {
+  console.error("YOUR_ID is present but is not a valid number:", YOUR_ID_RAW);
+  throw new Error("YOUR_ID must be a valid number");
+}
+
+const bot = new TelegramBot(TOKEN);
+const app = express();
+app.use(express.json());
+
+/*
+====================================
+GOOGLE SHEETS AUTH
+====================================
+*/
+
+const auth = new google.auth.GoogleAuth({
+  credentials: {
+    client_email: process.env.GOOGLE_CLIENT_EMAIL,
+    private_key: process.env.GOOGLE_PRIVATE_KEY
+      ? process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, "\n")
+      : undefined
+  },
+  scopes: ["https://www.googleapis.com/auth/spreadsheets"]
 });
 
-// userId -> { rowNumber, company, chatId, messageId, promptMessageId }
-const pendingComments = new Map();
+const sheets = google.sheets({ version: "v4", auth });
 
-// ======================
-// GOOGLE AUTH
-// ======================
-function getGoogleAuth() {
-  let privateKey = GOOGLE_PRIVATE_KEY.trim();
+/*
+====================================
+TABLE STRUCTURE
+====================================
 
-  if (
-    (privateKey.startsWith('"') && privateKey.endsWith('"')) ||
-    (privateKey.startsWith("'") && privateKey.endsWith("'"))
-  ) {
-    privateKey = privateKey.slice(1, -1);
-  }
+A = company
+B = manager_name
+C = manager_id
+D = last_order_date
+E = last_request_date
+F = status
+G = sent_at
+H = level
+I = comment
+J = commented_at
+K = alert_message_id
+L = prompt_message_id
+*/
 
-  privateKey = privateKey.replace(/\\n/g, '\n');
+const COL = {
+  company: 0,
+  managerName: 1,
+  managerId: 2,
+  lastOrderDate: 3,
+  lastRequestDate: 4,
+  status: 5,
+  sentAt: 6,
+  level: 7,
+  comment: 8,
+  commentedAt: 9,
+  alertMessageId: 10,
+  promptMessageId: 11
+};
 
-  return new google.auth.JWT({
-    email: GOOGLE_CLIENT_EMAIL,
-    key: privateKey,
-    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-  });
-}
+/*
+====================================
+RUNTIME LOCKS
+====================================
+*/
 
-async function getSheets() {
-  const auth = getGoogleAuth();
-  await auth.authorize();
+const pendingComments = {};
+let checkClientsRunning = false;
 
-  return google.sheets({
-    version: 'v4',
-    auth,
-  });
-}
+/*
+====================================
+HELPERS
+====================================
+*/
 
-// ======================
-// HELPERS
-// ======================
-function parseDate(dateStr) {
-  if (!dateStr) return null;
-
-  const value = String(dateStr).trim();
+function parseDate(value) {
   if (!value) return null;
 
-  let match = value.match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
-  if (match) {
-    const [, dd, mm, yyyy] = match;
-    const date = new Date(Number(yyyy), Number(mm) - 1, Number(dd));
+  if (value instanceof Date && !isNaN(value.getTime())) return value;
+
+  if (typeof value === "number") {
+    const date = new Date(Math.round((value - 25569) * 86400 * 1000));
     return isNaN(date.getTime()) ? null : date;
   }
 
-  match = value.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  if (match) {
-    const [, yyyy, mm, dd] = match;
-    const date = new Date(Number(yyyy), Number(mm) - 1, Number(dd));
+  const str = String(value).trim();
+  const ruMatch = str.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/);
+
+  if (ruMatch) {
+    const [, d, m, y] = ruMatch;
+    const date = new Date(Number(y), Number(m) - 1, Number(d));
     return isNaN(date.getTime()) ? null : date;
   }
 
-  const parsed = new Date(value);
-  return isNaN(parsed.getTime()) ? null : parsed;
+  const date = new Date(str);
+  return isNaN(date.getTime()) ? null : date;
 }
 
 function formatDate(date) {
-  const dd = String(date.getDate()).padStart(2, '0');
-  const mm = String(date.getMonth() + 1).padStart(2, '0');
-  const yyyy = date.getFullYear();
-  return `${dd}.${mm}.${yyyy}`;
+  if (!date) return "—";
+  return date.toLocaleDateString("ru-RU");
 }
 
-function addDays(date, days) {
-  const result = new Date(date);
-  result.setDate(result.getDate() + days);
-  return result;
+function daysDiff(date) {
+  const now = new Date();
+  const diff = now - date;
+  return Math.floor(diff / (1000 * 60 * 60 * 24));
 }
 
-function daysBetween(fromDate, toDate) {
-  const d1 = new Date(fromDate.getFullYear(), fromDate.getMonth(), fromDate.getDate());
-  const d2 = new Date(toDate.getFullYear(), toDate.getMonth(), toDate.getDate());
-  const msPerDay = 24 * 60 * 60 * 1000;
-  return Math.floor((d2 - d1) / msPerDay);
+function getLevelByDays(days) {
+  if (days >= 35) {
+    return {
+      level: "🚨 КРИТИЧНО",
+      recommendation: "Свяжись с клиентом срочно. Высокий риск потери клиента."
+    };
+  }
+
+  if (days >= 30) {
+    return {
+      level: "🔴 LOST",
+      recommendation: "Клиент в зоне потери. Требуется активная работа."
+    };
+  }
+
+  return null;
 }
 
-function getLatestActivityDate(lastOrderDate, lastRequestDate) {
-  const dates = [lastOrderDate, lastRequestDate].filter(Boolean);
-  if (!dates.length) return null;
-  return new Date(Math.max(...dates.map((d) => d.getTime())));
+function colLetter(colIndexZeroBased) {
+  let dividend = colIndexZeroBased + 1;
+  let columnName = "";
+
+  while (dividend > 0) {
+    const modulo = (dividend - 1) % 26;
+    columnName = String.fromCharCode(65 + modulo) + columnName;
+    dividend = Math.floor((dividend - modulo) / 26);
+  }
+
+  return columnName;
 }
 
-function normalizeTelegramId(rawValue) {
-  let value = String(rawValue || '').trim();
-  value = value.replace(/\.0$/, '');
-  return value;
+function formatDateKey(date) {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
 }
 
-function shortCompanyName(name) {
-  const value = String(name || '').trim();
-  if (!value) return 'Клиент';
-
-  return value
-    .replace(/^ООО\s+/i, '')
-    .replace(/^ИП\s+/i, '')
-    .replace(/^АО\s+/i, '')
-    .replace(/^ЗАО\s+/i, '')
-    .replace(/^ПАО\s+/i, '')
-    .replace(/^["«]/, '')
-    .replace(/["»]$/, '')
-    .trim();
+function parseSentAtDate(value) {
+  if (!value) return null;
+  const date = parseDate(value);
+  return date;
 }
 
-function isSameDate(dateA, dateB) {
-  if (!dateA || !dateB) return false;
-
+function isSameDay(a, b) {
   return (
-    dateA.getFullYear() === dateB.getFullYear() &&
-    dateA.getMonth() === dateB.getMonth() &&
-    dateA.getDate() === dateB.getDate()
+    a.getFullYear() === b.getFullYear() &&
+    a.getMonth() === b.getMonth() &&
+    a.getDate() === b.getDate()
   );
 }
 
-function addCount(map, key, value = 1) {
-  map.set(key, (map.get(key) || 0) + value);
+function wasSentToday(sentAtValue) {
+  const sentDate = parseSentAtDate(sentAtValue);
+  if (!sentDate) return false;
+  return isSameDay(sentDate, new Date());
 }
 
-function formatManagerStats(title, statsMap) {
-  const entries = [...statsMap.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], 'ru'));
-  if (!entries.length) {
-    return `${title}:\n• Нет`;
-  }
+function buildClientMessage(company, orderDate, requestDate, orderDays, requestDays, levelData, effectiveDays) {
+  return `${levelData.level}
+Клиент: ${company}
 
-  return `${title}:\n${entries.map(([manager, count]) => `• ${manager} — ${count}`).join('\n')}`;
+Последний заказ: ${formatDate(orderDate)} (${orderDays} дн.)
+Последний запрос: ${formatDate(requestDate)} (${requestDays} дн.)
+
+Фактически без активности: ${effectiveDays} дн.
+
+Рекомендация: ${levelData.recommendation}`;
 }
 
-async function safeSend(chatId, text, options = {}) {
-  const message = String(text || '').trim();
-  if (!message) return null;
-
-  const MAX_LENGTH = 4000;
-
-  if (message.length <= MAX_LENGTH) {
-    return await bot.sendMessage(chatId, message, options);
-  }
-
-  let lastMessage = null;
-  for (let i = 0; i < message.length; i += MAX_LENGTH) {
-    const part = message.slice(i, i + MAX_LENGTH);
-    lastMessage = await bot.sendMessage(chatId, part, i === 0 ? options : {});
-  }
-
-  return lastMessage;
-}
-
-// ======================
-// SHEETS
-// ======================
-async function loadClientsFromSheet() {
-  const sheets = await getSheets();
-
-  const response = await sheets.spreadsheets.values.get({
-    spreadsheetId: GOOGLE_SHEET_ID,
-    range: GOOGLE_SHEET_RANGE,
+async function getSheetRows() {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID,
+    range: `${SHEET_NAME}!A:L`
   });
 
-  return response.data.values || [];
+  return res.data.values || [];
 }
 
-async function updateClientRow(rowNumber, updates) {
-  const sheets = await getSheets();
+async function getRowValues(rowNumber) {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID,
+    range: `${SHEET_NAME}!A${rowNumber}:L${rowNumber}`
+  });
 
-  const columns = {
-    status: 'G',
-    notificationDate: 'I',
-    comment: 'J',
-    reactionDate: 'K',
-    nextCheckDate: 'L',
-  };
+  return (res.data.values && res.data.values[0]) || [];
+}
 
-  for (const [key, col] of Object.entries(columns)) {
-    if (updates[key] !== undefined) {
-      await sheets.spreadsheets.values.update({
-        spreadsheetId: GOOGLE_SHEET_ID,
-        range: `${col}${rowNumber}`,
-        valueInputOption: 'USER_ENTERED',
-        requestBody: {
-          values: [[updates[key]]],
-        },
-      });
+async function updateCell(rowNumber, colIndexZeroBased, value) {
+  const column = colLetter(colIndexZeroBased);
+
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SHEET_ID,
+    range: `${SHEET_NAME}!${column}${rowNumber}`,
+    valueInputOption: "USER_ENTERED",
+    requestBody: {
+      values: [[value]]
     }
+  });
+}
+
+async function updateRowFields(rowNumber, fields) {
+  const updates = Object.entries(fields);
+
+  for (const [colIndex, value] of updates) {
+    await updateCell(rowNumber, Number(colIndex), value);
   }
 }
 
-// ======================
-// MESSAGE BUILDING
-// ======================
-function buildClientMessage(company, lastOrderDateStr, daysWithoutActivity) {
-  let priority = '';
-  let recommendation = '';
-
-  if (daysWithoutActivity >= 55) {
-    priority = '🚨 КРИТИЧНО';
-    recommendation = 'Свяжись с клиентом срочно. Высокий риск потери клиента.';
-  } else if (daysWithoutActivity >= 45) {
-    priority = '⚠️ ВАЖНО';
-    recommendation = 'Нужно связаться с клиентом в ближайшее время.';
-  } else {
-    priority = '📌 ВНИМАНИЕ';
-    recommendation = 'Рекомендуется проверить клиента и напомнить о себе.';
-  }
-
-  return `${priority}
-Клиент - ${company}
-Последний заказ: ${lastOrderDateStr || '-'}
-Прошло: ${daysWithoutActivity} дней без заказа
-
-Рекомендации: ${recommendation}`;
+async function sendMessageWithButtons(chatId, text, company) {
+  return bot.sendMessage(chatId, text, {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "✅ Связался", callback_data: `contacted|${company}` },
+          { text: "⚠ Нерегулярный", callback_data: `irregular|${company}` }
+        ]
+      ]
+    }
+  });
 }
 
-// ======================
-// REPORTS
-// ======================
-function buildLeaderReport(rows, reportDate) {
-  const dataRows = rows.slice(1);
+async function safeDeleteMessage(chatId, messageId) {
+  if (!chatId || !messageId) return;
 
-  let contactedTotal = 0;
-  let notReactedTotal = 0;
-
-  const contactedByManager = new Map();
-  const notReactedByManager = new Map();
-
-  for (const row of dataRows) {
-    const manager = (row[1] || 'Без менеджера').toString().trim();
-    const notificationDateStr = (row[8] || '').toString().trim();
-    const reactionDateStr = (row[10] || '').toString().trim();
-
-    const notificationDate = parseDate(notificationDateStr);
-    const reactionDate = parseDate(reactionDateStr);
-
-    const notifiedToday = notificationDate && isSameDate(notificationDate, reportDate);
-    const reactedToday = reactionDate && isSameDate(reactionDate, reportDate);
-
-    if (reactedToday) {
-      contactedTotal++;
-      addCount(contactedByManager, manager);
-    }
-
-    if (notifiedToday && !reactedToday) {
-      notReactedTotal++;
-      addCount(notReactedByManager, manager);
-    }
+  try {
+    await bot.deleteMessage(chatId, String(messageId));
+  } catch (e) {
+    console.log("Delete message skipped:", e?.response?.body || e.message);
   }
-
-  return `📊 Ежедневный отчет по клиентам
-
-Связались: ${contactedTotal}
-Не отреагировали: ${notReactedTotal}
-
-${formatManagerStats('Связались', contactedByManager)}
-
-${formatManagerStats('Не отреагировали', notReactedByManager)}`;
 }
 
-async function sendLeaderReport() {
-  if (!ADMIN_CHAT_ID) return;
+async function answerCallback(callbackId, text) {
+  try {
+    await bot.answerCallbackQuery(callbackId, { text });
+  } catch (e) {
+    console.log("answerCallback error:", e?.response?.body || e.message);
+  }
+}
 
-  const rows = await loadClientsFromSheet();
-  if (!rows || rows.length < 2) {
-    await safeSend(ADMIN_CHAT_ID, '📊 Ежедневный отчет: в таблице нет данных.');
+/*
+====================================
+CHECK CLIENTS
+====================================
+*/
+
+async function checkClients() {
+  if (checkClientsRunning) {
+    console.log("checkClients skipped: another run is already in progress");
     return;
   }
 
-  const today = new Date();
-  const reportText = buildLeaderReport(rows, today);
-  await safeSend(ADMIN_CHAT_ID, reportText);
-}
+  checkClientsRunning = true;
+  console.log("checkClients started");
 
-// ======================
-// CORE LOGIC
-// ======================
-async function sendCriticalClients(triggerChatId = null) {
-  const rows = await loadClientsFromSheet();
+  try {
+    const rows = await getSheetRows();
 
-  if (!rows || rows.length < 2) {
-    if (triggerChatId) {
-      await safeSend(triggerChatId, 'В таблице нет данных для проверки.');
-    }
-    return;
-  }
-
-  const dataRows = rows.slice(1);
-  const today = new Date();
-
-  let sentCount = 0;
-  let skippedNoTelegramId = 0;
-  let failedCount = 0;
-  let skippedAlreadySentToday = 0;
-
-  for (let i = 0; i < dataRows.length; i++) {
-    const row = dataRows[i];
-
-    const company = (row[0] || '').toString().trim();
-    const manager = (row[1] || '').toString().trim();
-    const managerTelegramId = normalizeTelegramId(row[2]);
-    const lastOrderDateStr = (row[3] || '').toString().trim();
-    const lastRequestDateStr = (row[4] || '').toString().trim();
-    const status = (row[6] || '').toString().trim();
-    const notificationDateStr = (row[8] || '').toString().trim();
-    const nextCheckDateStr = (row[11] || '').toString().trim();
-
-    if (!company) continue;
-
-    if (!managerTelegramId || !/^\d+$/.test(managerTelegramId)) {
-      skippedNoTelegramId++;
-      continue;
+    if (!rows.length) {
+      console.log("No rows found in sheet");
+      return;
     }
 
-    const lastOrderDate = parseDate(lastOrderDateStr);
-    const lastRequestDate = parseDate(lastRequestDateStr);
-    const notificationDate = parseDate(notificationDateStr);
-    const nextCheckDate = parseDate(nextCheckDateStr);
+    for (let i = 1; i < rows.length; i++) {
+      const row = rows[i];
+      const rowNumber = i + 1;
 
-    if (status.toLowerCase() === 'связался' && nextCheckDate && nextCheckDate > today) {
-      continue;
-    }
+      const company = row[COL.company];
+      const managerId = row[COL.managerId];
+      const lastOrderRaw = row[COL.lastOrderDate];
+      const lastRequestRaw = row[COL.lastRequestDate];
+      const sentAtRaw = row[COL.sentAt];
+      const existingAlertMessageId = row[COL.alertMessageId];
 
-    if (notificationDate && isSameDate(notificationDate, today)) {
-      skippedAlreadySentToday++;
-      continue;
-    }
+      if (!company || !managerId) {
+        console.log(`Row ${rowNumber} skipped: no company or managerId`);
+        continue;
+      }
 
-    const latestActivityDate = getLatestActivityDate(lastOrderDate, lastRequestDate);
-    if (!latestActivityDate) continue;
+      if (existingAlertMessageId) {
+        console.log(`Row ${rowNumber} skipped: alert already exists`);
+        continue;
+      }
 
-    const daysWithoutActivity = daysBetween(latestActivityDate, today);
+      if (wasSentToday(sentAtRaw)) {
+        console.log(`Row ${rowNumber} skipped: already sent today`);
+        continue;
+      }
 
-    if (daysWithoutActivity < 25) {
-      continue;
-    }
+      const lastOrderDate = parseDate(lastOrderRaw);
+      const lastRequestDate = parseDate(lastRequestRaw);
 
-    const text = buildClientMessage(company, lastOrderDateStr, daysWithoutActivity);
+      if (!lastOrderDate || !lastRequestDate) {
+        console.log(`Row ${rowNumber} skipped: invalid dates`);
+        continue;
+      }
 
-    try {
-      await bot.sendMessage(managerTelegramId, text, {
-        reply_markup: {
-          inline_keyboard: [
-            [
-              {
-                text: 'Связался',
-                callback_data: `contacted_${i + 2}`,
-              },
-            ],
-          ],
-        },
-      });
+      const orderDays = daysDiff(lastOrderDate);
+      const requestDays = daysDiff(lastRequestDate);
 
-      await updateClientRow(i + 2, {
-        notificationDate: formatDate(today),
-      });
+      if (orderDays < 30 || requestDays < 30) {
+        console.log(`Row ${rowNumber} skipped: one of dates is less than 30 days`);
+        continue;
+      }
 
-      sentCount++;
-    } catch (error) {
-      failedCount++;
-      console.error(
-        `Не удалось отправить менеджеру ${manager} (${managerTelegramId}) по клиенту ${company}:`,
-        error.response?.body || error.message || error
+      const effectiveDays = Math.min(orderDays, requestDays);
+      const levelData = getLevelByDays(effectiveDays);
+
+      if (!levelData) {
+        console.log(`Row ${rowNumber} skipped: no level for ${effectiveDays}`);
+        continue;
+      }
+
+      // Повторно читаем строку перед отправкой — защита от параллельного запуска
+      const freshRow = await getRowValues(rowNumber);
+      const freshSentAt = freshRow[COL.sentAt];
+      const freshAlertMessageId = freshRow[COL.alertMessageId];
+
+      if (freshAlertMessageId) {
+        console.log(`Row ${rowNumber} skipped after refresh: alert already exists`);
+        continue;
+      }
+
+      if (wasSentToday(freshSentAt)) {
+        console.log(`Row ${rowNumber} skipped after refresh: already sent today`);
+        continue;
+      }
+
+      // Ставим временный lock в alert_message_id ДО отправки
+      const lockValue = `LOCK_${Date.now()}`;
+      await updateCell(rowNumber, COL.alertMessageId, lockValue);
+
+      // Еще раз читаем, чтобы убедиться, что lock наш/есть
+      const lockedRow = await getRowValues(rowNumber);
+      const lockedAlertValue = lockedRow[COL.alertMessageId];
+
+      if (!lockedAlertValue || String(lockedAlertValue).trim() === "") {
+        console.log(`Row ${rowNumber} skipped: failed to set row lock`);
+        continue;
+      }
+
+      const message = buildClientMessage(
+        company,
+        lastOrderDate,
+        lastRequestDate,
+        orderDays,
+        requestDays,
+        levelData,
+        effectiveDays
       );
-    }
-  }
 
-  if (triggerChatId) {
-    await safeSend(
-      triggerChatId,
-      `Проверка завершена.
-Отправлено: ${sentCount}
-Уже было сегодня: ${skippedAlreadySentToday}
-Без ID: ${skippedNoTelegramId}
-Ошибок: ${failedCount}`
-    );
+      try {
+        const sent = await sendMessageWithButtons(managerId, message, company);
+
+        await updateRowFields(rowNumber, {
+          [COL.sentAt]: new Date().toLocaleString("ru-RU"),
+          [COL.level]: levelData.level,
+          [COL.alertMessageId]: sent.message_id,
+          [COL.promptMessageId]: "",
+          [COL.comment]: "",
+          [COL.commentedAt]: ""
+        });
+
+        console.log(`Alert sent for company: ${company}`);
+      } catch (e) {
+        // если отправка не удалась — снимаем lock
+        await updateCell(rowNumber, COL.alertMessageId, "");
+        console.error(`Error sending alert for ${company}:`, e?.message || e);
+      }
+    }
+
+    console.log("checkClients finished");
+  } finally {
+    checkClientsRunning = false;
   }
 }
 
-// ======================
-// COMMANDS
-// ======================
-bot.onText(/\/start/, async (msg) => {
-  await safeSend(
-    msg.chat.id,
-    `Бот активен.
+/*
+====================================
+COMMENT FLOW
+====================================
+*/
 
-Команды:
-/testmessage — тестовое сообщение
-/testsheet — тест чтения таблицы
-/check — ручная рассылка менеджерам
-/report — отчет руководителю за сегодня
-/sendtest — тест отправки в ADMIN_CHAT_ID
-/myid — показать твой Telegram ID`
-  );
-});
+async function startCommentFlow(chatId, company, action, callbackMessageId) {
+  const rows = await getSheetRows();
 
-bot.onText(/\/myid/, async (msg) => {
-  await safeSend(msg.chat.id, `Твой Telegram ID: ${msg.chat.id}`);
-});
+  for (let i = 1; i < rows.length; i++) {
+    const row = rows[i];
 
-bot.onText(/\/testmessage/, async (msg) => {
-  try {
-    await safeSend(msg.chat.id, 'Тестовое сообщение: бот работает.');
-  } catch (error) {
-    console.error('Ошибка в /testmessage:', error);
-    await safeSend(msg.chat.id, `Ошибка: ${error.message}`);
-  }
-});
+    if (row[COL.company] === company) {
+      const rowNumber = i + 1;
+      const statusText = action === "contacted" ? "Связался" : "Нерегулярный";
 
-bot.onText(/\/testsheet/, async (msg) => {
-  try {
-    const rows = await loadClientsFromSheet();
-
-    const preview = rows
-      .slice(0, 5)
-      .map((row, index) => `${index + 1}: ${row.join(' | ')}`)
-      .join('\n');
-
-    await safeSend(
-      msg.chat.id,
-      `Таблица читается.
-Строк: ${rows.length}
-
-${preview || 'Нет данных'}`
-    );
-  } catch (error) {
-    console.error('Ошибка в /testsheet:', error);
-    await safeSend(msg.chat.id, `Ошибка чтения таблицы: ${error.message}`);
-  }
-});
-
-bot.onText(/\/check/, async (msg) => {
-  try {
-    await safeSend(msg.chat.id, 'Запускаю рассылку уведомлений менеджерам...');
-    await sendCriticalClients(msg.chat.id);
-  } catch (error) {
-    console.error('Ошибка в /check:', error);
-    await safeSend(msg.chat.id, `Ошибка проверки: ${error.message}`);
-  }
-});
-
-bot.onText(/\/report/, async (msg) => {
-  try {
-    const rows = await loadClientsFromSheet();
-    if (!rows || rows.length < 2) {
-      return await safeSend(msg.chat.id, 'В таблице нет данных для отчета.');
-    }
-
-    const text = buildLeaderReport(rows, new Date());
-    await safeSend(msg.chat.id, text);
-  } catch (error) {
-    console.error('Ошибка в /report:', error);
-    await safeSend(msg.chat.id, `Ошибка отчета: ${error.message}`);
-  }
-});
-
-bot.onText(/\/sendtest/, async (msg) => {
-  try {
-    if (!ADMIN_CHAT_ID) {
-      return await safeSend(msg.chat.id, 'Не задан ADMIN_CHAT_ID в Railway Variables.');
-    }
-
-    await safeSend(ADMIN_CHAT_ID, 'Ручная тестовая рассылка сработала.');
-    await safeSend(msg.chat.id, 'Тестовая отправка выполнена.');
-  } catch (error) {
-    console.error('Ошибка в /sendtest:', error);
-    await safeSend(msg.chat.id, `Ошибка: ${error.message}`);
-  }
-});
-
-// ======================
-// CALLBACK
-// ======================
-bot.on('callback_query', async (query) => {
-  try {
-    const chatId = query.message.chat.id;
-    const messageId = query.message.message_id;
-    const data = query.data;
-    const userId = query.from.id;
-
-    if (!data || !data.startsWith('contacted_')) {
-      await bot.answerCallbackQuery(query.id);
-      return;
-    }
-
-    const rowNumber = Number(data.replace('contacted_', ''));
-    if (!rowNumber) {
-      await bot.answerCallbackQuery(query.id, {
-        text: 'Не удалось определить строку клиента',
+      await updateRowFields(rowNumber, {
+        [COL.status]: statusText
       });
-      return;
+
+      const prompt = await bot.sendMessage(
+        chatId,
+        `✍️ Добавь комментарий по клиенту "${company}" одним сообщением.\n\nПосле комментария уведомление будет убрано из чата.`
+      );
+
+      pendingComments[chatId] = {
+        company,
+        action,
+        rowNumber,
+        alertMessageId: callbackMessageId,
+        promptMessageId: prompt.message_id
+      };
+
+      await updateCell(rowNumber, COL.promptMessageId, prompt.message_id);
+      return true;
     }
-
-    const rows = await loadClientsFromSheet();
-    const row = rows[rowNumber - 1] || [];
-    const company = (row[0] || '').toString().trim() || 'Без названия';
-
-    await bot.answerCallbackQuery(query.id, {
-      text: 'Напиши комментарий по клиенту',
-    });
-
-    const promptMessage = await safeSend(chatId, `Напиши комментарий по клиенту ${company}:`);
-
-    pendingComments.set(userId, {
-      rowNumber,
-      company,
-      chatId,
-      messageId,
-      promptMessageId: promptMessage?.message_id,
-    });
-  } catch (error) {
-    console.error('Ошибка callback_query:', error);
-
-    try {
-      await bot.answerCallbackQuery(query.id, {
-        text: 'Ошибка обработки кнопки',
-      });
-    } catch (_) {}
   }
+
+  return false;
+}
+
+async function saveCommentAndCleanup(chatId, commentText, managerCommentMessageId) {
+  const pending = pendingComments[chatId];
+  if (!pending) return false;
+
+  const { company, action, rowNumber, alertMessageId, promptMessageId } = pending;
+  const finalStatus = action === "contacted" ? "Связался" : "Нерегулярный";
+
+  await updateRowFields(rowNumber, {
+    [COL.status]: finalStatus,
+    [COL.comment]: commentText,
+    [COL.commentedAt]: new Date().toLocaleString("ru-RU"),
+    [COL.alertMessageId]: "",
+    [COL.promptMessageId]: ""
+  });
+
+  await safeDeleteMessage(chatId, alertMessageId);
+  await safeDeleteMessage(chatId, promptMessageId);
+  await safeDeleteMessage(chatId, managerCommentMessageId);
+
+  delete pendingComments[chatId];
+
+  return {
+    company,
+    status: finalStatus,
+    comment: commentText
+  };
+}
+
+/*
+====================================
+REPORT
+====================================
+*/
+
+async function weeklyReport() {
+  const rows = await getSheetRows();
+  if (!rows.length) return;
+
+  let lost = 0;
+  let critical = 0;
+  let withComment = 0;
+  let withoutComment = 0;
+
+  for (let i = 1; i < rows.length; i++) {
+    const row = rows[i];
+    const level = row[COL.level] || "";
+    const comment = row[COL.comment] || "";
+    const alertMessageId = row[COL.alertMessageId] || "";
+
+    if (level.includes("LOST")) lost++;
+    else if (level.includes("КРИТИЧНО")) critical++;
+
+    if (comment) withComment++;
+    if (alertMessageId) withoutComment++;
+  }
+
+  const report = `📊 Недельный отчет
+
+🔴 LOST: ${lost}
+🚨 Критично: ${critical}
+
+✅ С комментарием: ${withComment}
+⏳ Без комментария: ${withoutComment}`;
+
+  await bot.sendMessage(YOUR_ID, report);
+}
+
+/*
+====================================
+ROUTES
+====================================
+*/
+
+app.get("/", (req, res) => {
+  res.status(200).send("Client Attention Bot is running");
 });
 
-// ======================
-// COMMENT SAVE
-// ======================
-bot.on('message', async (msg) => {
+app.get("/debug", (req, res) => {
+  res.status(200).json({
+    ok: true,
+    message: "debug route works"
+  });
+});
+
+app.post("/webhook", async (req, res) => {
+  console.log("WEBHOOK HIT:", JSON.stringify(req.body));
+
   try {
-    const userId = msg.from.id;
-    const chatId = msg.chat.id;
-    const text = msg.text;
+    const update = req.body;
 
-    if (!text) return;
-    if (text.startsWith('/')) return;
+    if (update.callback_query) {
+      const callback = update.callback_query;
+      const [action, company] = String(callback.data || "").split("|");
 
-    const pending = pendingComments.get(userId);
-    if (!pending) return;
-
-    const today = new Date();
-    const reactionDate = formatDate(today);
-    const nextCheckDate = formatDate(addDays(today, 25));
-    const companyShort = shortCompanyName(pending.company);
-
-    await updateClientRow(pending.rowNumber, {
-      status: 'Связался',
-      comment: text,
-      reactionDate,
-      nextCheckDate,
-    });
-
-    try {
-      await bot.deleteMessage(pending.chatId, String(pending.messageId));
-    } catch (e) {
-      console.error('Не удалось удалить карточку:', e.message);
-    }
-
-    if (pending.promptMessageId) {
-      try {
-        await bot.deleteMessage(pending.chatId, String(pending.promptMessageId));
-      } catch (e) {
-        console.error('Не удалось удалить prompt:', e.message);
+      if (!action || !company) {
+        await answerCallback(callback.id, "Некорректные данные");
+        return res.sendStatus(200);
       }
+
+      const chatId = callback.message.chat.id;
+      const callbackMessageId = callback.message.message_id;
+
+      const ok = await startCommentFlow(chatId, company, action, callbackMessageId);
+
+      if (ok) {
+        await answerCallback(callback.id, "Статус принят, жду комментарий");
+      } else {
+        await answerCallback(callback.id, "Клиент не найден в таблице");
+      }
+
+      return res.sendStatus(200);
     }
 
-    await safeSend(
-      chatId,
-      `✅ ${companyShort} — отмечен
-Следующая проверка: ${nextCheckDate}`
-    );
+    if (update.message && update.message.text) {
+      const chatId = update.message.chat.id;
+      const text = update.message.text.trim();
+      const messageId = update.message.message_id;
 
-    pendingComments.delete(userId);
-  } catch (error) {
-    console.error('Ошибка обработки комментария:', error);
-    await safeSend(msg.chat.id, `Ошибка сохранения комментария: ${error.message}`);
-  }
-});
+      if (pendingComments[chatId]) {
+        const result = await saveCommentAndCleanup(chatId, text, messageId);
 
-// ======================
-// CRON
-// ======================
-cron.schedule(
-  '0 11 * * 1,3,5',
-  async () => {
-    console.log('=== CRON: плановая проверка клиентов ===');
+        if (result) {
+          await bot.sendMessage(
+            YOUR_ID,
+            `📝 Новый комментарий
 
-    try {
-      await sendCriticalClients(ADMIN_CHAT_ID || null);
-      await sendLeaderReport();
-    } catch (error) {
-      console.error('Ошибка плановой проверки:', error);
-
-      if (ADMIN_CHAT_ID) {
-        try {
-          await safeSend(ADMIN_CHAT_ID, `Ошибка плановой проверки: ${error.message}`);
-        } catch (e) {
-          console.error('Не удалось отправить ошибку админу:', e.message);
+Клиент: ${result.company}
+Статус: ${result.status}
+Комментарий: ${result.comment}`
+          );
         }
+
+        return res.sendStatus(200);
       }
+
+      if (text === "/start") {
+        await bot.sendMessage(chatId, "Бот Внимание на клиента активен ✅");
+      }
+
+      if (text === "/check") {
+        await checkClients();
+        await bot.sendMessage(chatId, "Проверка клиентов выполнена ✅");
+      }
+
+      if (text === "/weekly") {
+        await weeklyReport();
+        await bot.sendMessage(chatId, "Недельный отчет отправлен ✅");
+      }
+
+      return res.sendStatus(200);
     }
-  },
-  {
-    timezone: 'Asia/Vladivostok',
+
+    return res.sendStatus(200);
+  } catch (e) {
+    console.error("Webhook error:", e?.response?.body || e.message || e);
+    return res.sendStatus(200);
   }
-);
-
-// ======================
-// ERRORS
-// ======================
-bot.on('polling_error', (error) => {
-  console.error('Polling error:', error?.message || error);
 });
 
-process.on('unhandledRejection', (reason) => {
-  console.error('Unhandled Rejection:', reason);
+app.get("/run-check", async (req, res) => {
+  try {
+    await checkClients();
+    res.send("checkClients done");
+  } catch (e) {
+    console.error("run-check error:", e?.message || e);
+    res.status(500).send(`Error in checkClients: ${e?.message || "unknown error"}`);
+  }
 });
 
-process.on('uncaughtException', (error) => {
-  console.error('Uncaught Exception:', error);
+app.get("/run-weekly", async (req, res) => {
+  try {
+    await weeklyReport();
+    res.send("weeklyReport done");
+  } catch (e) {
+    console.error("run-weekly error:", e?.message || e);
+    res.status(500).send("Error in weeklyReport");
+  }
 });
 
-console.log('Бот запущен');
+/*
+====================================
+START
+====================================
+*/
+
+async function start() {
+  app.listen(PORT, "0.0.0.0", async () => {
+    console.log(`Server listening on ${PORT}`);
+
+    const webhook = `${WEBHOOK_URL}/webhook`;
+    console.log("Setting webhook to:", webhook);
+
+    await bot.setWebHook(webhook);
+
+    console.log("Webhook set successfully");
+  });
+}
+
+start().catch((e) => {
+  console.error("Start error:", e?.response?.body || e.message || e);
+});
